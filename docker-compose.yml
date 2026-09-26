@@ -1,0 +1,569 @@
+# GridSnare — Phase 1 lab stack (Modbus track)
+#
+# Source of truth: docs/SPEC.md
+#   Section 7.1  honeypot module (Conpot decoy PLC)
+#   Section 7.2  protocol traffic monitor (Scapy)
+#   Section 11   all components on an isolated internal network, no internet exposure
+#   Section 19   repository layout
+#
+# The `version:` key is deliberately omitted — it is obsolete in Compose v2.
+
+name: gridsnare
+
+services:
+  # ---------------------------------------------------------------------------
+  # Decoy PLC / HMI — Conpot (SPEC 7.1)
+  # Every interaction with this container is inherently suspicious (DR-1).
+  # ---------------------------------------------------------------------------
+  honeypot:
+    image: honeynet/conpot:latest
+    # Honeynet Project's upstream image (last pushed 2019-02-04,
+    # digest sha256:cd93e88d9e44b020db691fc4c75cb29e76b5e90ddbc408aca26e6c78c5646976).
+    # Its default CMD is left unmodified:
+    #   conpot --template default --logfile /var/log/conpot/conpot.log -f --temp_dir /tmp
+    #
+    # NOTE on `-f`: in Conpot 0.6.0 that flag is `--force`, i.e. "use the testing
+    # configuration", NOT "run in the foreground". The consequence is that every
+    # protocol is bound to a non-privileged port, and in particular **Modbus TCP
+    # listens on 5020, not 502**. Listening ports observed at startup:
+    #   modbus 5020 | s7comm 10201 | http 8800 | snmp 16100 | ipmi 6230
+    #   enip 44818 | bacnet 47808 | ftp 2121 | tftp 6969
+    # Running the non-testing template on the standard port 502 is a Phase 1
+    # decision still open; if it changes, this healthcheck must change with it.
+    container_name: gridsnare-honeypot
+    restart: unless-stopped
+
+    # No `ports:` on purpose — the decoy is reachable only from inside scada_net,
+    # so nothing is exposed on the host or LAN (SPEC 11). Add a 127.0.0.1-bound
+    # mapping here temporarily only if you need to poke it from the host by hand.
+
+    # Fixed address (see the scada_net ipam block below). DR-5's allow-list and the
+    # test plan both need the decoy's IP to be the same on every boot — an
+    # auto-assigned address would silently change what "known asset" means.
+    networks:
+      scada_net:
+        ipv4_address: 172.20.0.2
+
+    volumes:
+      # Conpot logs every interaction to /var/log/conpot/conpot.log *inside* this
+      # container. It is a named volume rather than image-local content so the
+      # honeypot ingester below can transcribe the decoy's own record of each
+      # interaction — SPEC.md Section 9 step 2 — instead of that record being trapped
+      # inside one container.
+      #
+      # A fresh named volume is initialised from the image, which ships
+      # /var/log/conpot owned by the non-root `conpot` user, so the decoy keeps write
+      # access (verified: the mountpoint reads `drwxr-xr-x conpot conpot` and the decoy
+      # writes its log into it). The consequence worth knowing: attaching this volume
+      # starts a new log file, because the previous one lived in the old container.
+      - conpot_logs:/var/log/conpot
+
+    # Liveness = "Conpot's Modbus listener is up on 5020", not just "the process
+    # is alive". Conpot needs ~10-15s to bind: on this internal network the two
+    # ext_ip lookups in conpot.utils.ext_ip time out before it does.
+    #
+    # This deliberately inspects the listening socket instead of opening a TCP
+    # connection. A healthcheck that connects is itself a honeypot interaction
+    # from 127.0.0.1, and Conpot logs it as a new Modbus session — which would
+    # feed fabricated "Critical / DR-1" honeypot events into the pipeline every
+    # interval. Verified: `netstat` (busybox) exists in the image.
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -ltn | grep -q '0.0.0.0:5020'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    # TODO (SPEC 19): once honeypot/conpot_config/ holds the custom PLC/HMI
+    # template, mount it here and point Conpot at it with `--template`/`--template-dir`.
+
+  # ---------------------------------------------------------------------------
+  # Legitimate Modbus PLC simulator — SPEC.md Section 11 (required component)
+  #
+  # The asset that baseline/legitimate traffic actually targets. Section 11 is
+  # explicit that this is not optional, and this project is why: the honeypot has no
+  # legitimate traffic by design (Section 7.1), so a "no false positive" test aimed
+  # at the decoy is really testing that the decoy's own correct alert is absent.
+  #
+  # Measured before this existed: 40 whitelisted baseline reads aimed at the decoy
+  # produced 80 Critical alerts (40 DR-1 + 40 DR-7). Aimed here, they produce none —
+  # this server is a plain pymodbus device that serves the reads, accepts writes and
+  # keeps no record, so an alert during TC-2 is a genuine false positive.
+  # ---------------------------------------------------------------------------
+  plc:
+    build:
+      context: .
+      dockerfile: plc/Dockerfile
+    container_name: gridsnare-plc
+    restart: unless-stopped
+
+    # Its own fixed address, for the same reason the decoy has one: what "the
+    # legitimate PLC" means must not drift between boots. It shares nothing with the
+    # honeypot but the Modbus protocol, and writes nothing to the shared store.
+    networks:
+      scada_net:
+        ipv4_address: 172.20.0.6
+
+    # No published ports (SPEC Section 11: no internet exposure — this is reachable
+    # only from inside scada_net). No capabilities and no volumes either: a real
+    # device needs neither to answer Modbus.
+    #
+    # Liveness = "it is accepting connections on its Modbus port", which is the
+    # assertion that matters for the baseline. The probe connects over loopback, so
+    # it never reaches eth0 and cannot appear to any observer as lab traffic; it also
+    # sends no request, so even if it were seen it is not a Modbus command.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; socket.create_connection(('127.0.0.1', 502), 3).close()\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Protocol traffic monitor — Python 3 + Scapy (SPEC 7.2)
+  # Captures and parses Modbus TCP on the lab network, writes raw_events.
+  # ---------------------------------------------------------------------------
+  monitor:
+    build:
+      context: .
+      dockerfile: monitor/Dockerfile
+    container_name: gridsnare-monitor
+    depends_on:
+      honeypot:
+        condition: service_started
+    restart: unless-stopped
+
+    # The monitor joins the honeypot's network namespace instead of taking its
+    # own IP on scada_net.
+    #
+    # Why: a Linux bridge only forwards a frame to the port whose MAC matches (or
+    # floods broadcast / unknown unicast). A third container holding its own IP
+    # therefore does not receive unicast traffic between the decoy and a client,
+    # so a passive sniffer with its own address captures nothing on this segment.
+    #
+    # Sharing the decoy's eth0 is the container equivalent of a SPAN/mirror port
+    # on the decoy's link: it sees both directions of every Modbus exchange the
+    # decoy takes part in. Trade-offs: the monitor has no IP of its own, and
+    # unicast between two other containers that never touches the decoy stays
+    # invisible. A real deployment would mirror a switch port or route the
+    # monitored segment instead.
+    network_mode: "service:honeypot"
+
+    # Raw sockets to sniff (SPEC 7.2). NET_ADMIN is retained for a future
+    # promiscuous capture mode; the current capture runs non-promiscuous, which
+    # is sufficient because the frames are addressed to the shared interface.
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+
+    volumes:
+      # Shared SQLite data store + config-driven thresholds (SPEC 7.4, Section 8).
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+
+  # ---------------------------------------------------------------------------
+  # Second monitor tap — the legitimate PLC's link (SPEC 7.2)
+  #
+  # The same image and the same code as `monitor` above, deployed again on a second
+  # link. It is not symmetry: a Linux bridge forwards a frame only to the port whose
+  # MAC matches, so a passive observer holding its own address receives none of
+  # another container's unicast. That is why the Modbus monitor shares the decoy's
+  # namespace rather than taking its own IP, and it is why it cannot also see the PLC.
+  #
+  # Without this tap, TC-2 would pass **vacuously**: the baseline would be invisible to
+  # the observer and "no alerts" would describe the observer's blind spot rather than
+  # the rule set. That was measured, not assumed — the baseline's exchanges reach the
+  # store only once this service is running (see README's TC-2 evidence).
+  #
+  # Both taps write the same table as source='monitor', which is what they are: two
+  # vantage points on one monitored network, not two kinds of event.
+  # ---------------------------------------------------------------------------
+  monitor-plc:
+    build:
+      context: .
+      dockerfile: monitor/Dockerfile
+    image: gridsnare-monitor
+    container_name: gridsnare-monitor-plc
+    # service_healthy, not service_started: this container attaches to the PLC's network
+    # namespace, and `network_mode: service:plc` needs that namespace to have an interface
+    # already. Measured failure without this: the tap started while the PLC was still
+    # coming up, found no `eth0`, and exited — correctly, since it refuses to run while
+    # monitoring nothing and says so loudly (`capture did not start on eth0`).
+    depends_on:
+      plc:
+        condition: service_healthy
+    restart: unless-stopped
+
+    # Shares the PLC's namespace — the container equivalent of a SPAN port on the
+    # PLC's link. It has no address of its own, exactly like the decoy's tap.
+    network_mode: "service:plc"
+
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+
+    volumes:
+      # The same store, so the baseline's exchanges land beside the decoy's.
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+
+  # ---------------------------------------------------------------------------
+  # Anomaly & correlation engine — SPEC.md Sections 7.3 / 9 step 3
+  #
+  # "Correlation engine polls raw_events on an interval, applies DR-1 .. DR-7."
+  # This is that loop, running as a first-class service so it comes up with the rest
+  # of the stack and survives a recreate. It used to be started by hand with
+  # `docker compose exec -d monitor python -m engine.correlator`, which meant a fresh
+  # `docker compose up` had **no detection running at all** until someone remembered
+  # the step — and a recreate of the monitor silently killed it. SPEC.md Section 13
+  # asks for a setup process with no manual steps; this closes that gap.
+  #
+  # Reuses the monitor image (which already ships engine/ and store.py, per SPEC
+  # Section 11's "one container hosts the monitor + engine + dashboard") rather than
+  # adding a third build of the same pinned dependencies. No network: its only inputs
+  # are the mounted store and config, so an interface would be capability it cannot
+  # use — the same reasoning as the ingester below.
+  #
+  # Removing this service does not disable detection silently: the dashboard's Sensor
+  # health panel reports `Detection stopped` whenever the engine_state heartbeat goes
+  # stale, so an operator sees the loss instead of a quietly empty feed.
+  # ---------------------------------------------------------------------------
+  engine:
+    build:
+      context: .
+      dockerfile: monitor/Dockerfile
+    image: gridsnare-monitor
+    container_name: gridsnare-engine
+    command: ["python", "-u", "-m", "engine.correlator"]
+    restart: unless-stopped
+
+    # The engine does not use the network. It reads config.yaml and the shared store,
+    # writes alerts and the engine_state heartbeat, and originates nothing.
+    network_mode: "none"
+
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+
+    # Liveness only, and labelled as such: this asserts the poll loop process is
+    # alive, not that it is keeping up or that its judgements are right. Proving
+    # detection is what the Section 12 plan is for. Reads /proc/1/cmdline because
+    # pgrep does not exist in python:3.12-slim (see the goose service's note).
+    healthcheck:
+      test: ["CMD-SHELL", "tr '\\0' ' ' < /proc/1/cmdline | grep -q engine.correlator"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Honeypot interaction ingester — SPEC.md Section 9, step 2
+  #
+  # "In parallel, any honeypot interaction is logged to raw_events with
+  # source=honeypot." This is that parallel path: it tails the decoy's own log and
+  # writes one row per Modbus interaction, independently of the wire monitor's view of
+  # the same exchange. DR-1 fires on those rows and DR-7 correlates them with the
+  # monitor's, so without this service both rules have no live input at all.
+  # ---------------------------------------------------------------------------
+  honeypot-ingest:
+    build:
+      context: .
+      dockerfile: honeypot/Dockerfile
+    container_name: gridsnare-honeypot-ingest
+    restart: unless-stopped
+
+    # No network at all. Its only inputs are two files — the decoy's log (read-only)
+    # and the shared store (read-write) — so an interface would be capability it cannot
+    # use. It is not merely off scada_net: it has no interface with which to reach the
+    # monitored segment, or anything else. SPEC.md Section 11's boundary is drawn around
+    # that segment, and a component with no network cannot cross it.
+    network_mode: "none"
+
+    volumes:
+      # The decoy's log, read-only: this component consumes it and must never be able
+      # to alter the evidence it is transcribing.
+      - conpot_logs:/var/log/conpot:ro
+      # The shared store, read-write — recording honeypot events is its whole job.
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+
+    # Liveness only, and labelled as such: this asserts the ingester is running, not
+    # that it is keeping up with the log or that its rows are right. Proving ingestion
+    # is what TC-1 and TC-5 are for.
+    #
+    # Reads /proc/1/cmdline rather than using pgrep, which python:3.12-slim does not
+    # contain. The goose service's healthcheck was first written with pgrep and reported
+    # a perfectly healthy container `unhealthy` (see that service's note), so this is
+    # deliberate rather than incidental.
+    healthcheck:
+      test: ["CMD-SHELL", "tr '\\0' ' ' < /proc/1/cmdline | grep -q log_ingest.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Alert dashboard — Flask + Chart.js (SPEC.md Section 7.5)
+  # ---------------------------------------------------------------------------
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: gridsnare-dashboard
+    restart: unless-stopped
+
+    # 127.0.0.1 only. SPEC.md Section 7.5 accepts "no authentication needed for a
+    # local lab demo", which only holds while this is not reachable from the LAN.
+    ports:
+      - "127.0.0.1:5000:5000"
+
+    # No depends_on: the dashboard reads the store through this volume, so it
+    # starts happily on a cold stack and reports an empty state instead of failing.
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+
+    # Deliberately NOT on scada_net — see the ui_net note below.
+    networks:
+      - ui_net
+
+  # ---------------------------------------------------------------------------
+  # Decoy IED — IEC 61850 GOOSE protection relay (SPEC.md Section 20.2)
+  # Phase 2. libiec61850 + pyiec61850 are built inside this image (goose/Dockerfile);
+  # nothing is installed on the host (SPEC.md 20.5, README instruction 3).
+  # ---------------------------------------------------------------------------
+  goose:
+    build:
+      context: .
+      dockerfile: goose/Dockerfile
+    container_name: gridsnare-goose-decoy
+    restart: unless-stopped
+
+    # Unlike the Modbus monitor, this device needs its OWN address and MAC on
+    # scada_net: it injects raw Ethernet frames, and a container sharing another's
+    # network namespace cannot be given its own MAC address.
+    #
+    # The MAC is pinned because GR-2's known-publisher allow-list is keyed on it
+    # (SPEC.md 20.3). An auto-assigned MAC would silently change what "the
+    # legitimate publisher" means on every boot, and would make a spoofing test
+    # indistinguishable from a restart.
+    #
+    # 172.20.0.3 is fixed for the same reason DR-5's allow-list is fixed, and is
+    # currently NOT in engine.detection.known_asset_allow_list: the decoy is an
+    # unrecognised device as far as the Modbus rules are concerned, which is correct
+    # — it sends no Modbus traffic, so no DR-* rule should ever see it.
+    networks:
+      scada_net:
+        ipv4_address: 172.20.0.3
+        mac_address: "02:00:5e:00:53:01"
+
+    # NET_RAW only: raw Ethernet injection and capture. It is the single capability the
+    # decoy needs, and the comment below records why NET_ADMIN is deliberately absent.
+    #
+    # History worth keeping, because it explains the shape of the code. The decoy's
+    # subscriber originally used libiec61850's GooseReceiver, whose HAL enters
+    # promiscuous mode with ioctl(SIOCSIFFLAGS) setting IFF_PROMISC
+    # (hal/ethernet/linux/ethernet_linux.c, Ethernet_setMode). That ioctl needs
+    # NET_ADMIN and fails *silently*, so with NET_RAW alone the decoy published
+    # perfectly while its subscriber heard nothing (interface flags read 0x1003 — no
+    # IFF_PROMISC — and a GOOSE frame is multicast to 01-0c-cd-..., so an interface not
+    # in that group drops it in the kernel before the socket sees it).
+    #
+    # The receive path has since moved to our own AF_PACKET socket
+    # (goose/goose_frame.py), which joins the group with PACKET_MR_PROMISC instead.
+    # That membership does not require NET_ADMIN, so it is no longer granted.
+    #
+    # Measured, not assumed: a container built from this image with NET_RAW alone reads
+    # /sys/class/net/eth0/flags as 0x1103 (promiscuous *is* set), publishes frames that
+    # an independent capture decodes, and logs sightings for injected peer frames.
+    # Dropping the capability is the point of a decoy: it runs the minimum privilege
+    # that makes it look like a relay, so that a compromise of it buys the attacker
+    # as little as possible.
+    cap_add:
+      - NET_RAW
+
+    volumes:
+      # Same config the rest of the stack reads (SPEC.md Section 8). The decoy writes
+      # nothing to ./data — capturing and storing GOOSE events is the traffic
+      # monitor's job (SPEC.md 20.2), so there is no store mount here on purpose.
+      - ./config.yaml:/app/config.yaml:ro
+
+    # Liveness only, and deliberately labelled as such: this asserts the process is
+    # alive, NOT that frames are reaching the wire. Nothing inside this container
+    # can prove publication — that is what the GOOSE traffic monitor and the test
+    # plan (TC-7..TC-13) are for, and claiming otherwise here would be dressing up
+    # a process check as a protocol check.
+    #
+    # Reads /proc/1/cmdline rather than using pgrep, because pgrep does not exist in
+    # a python:3.12-slim image. The first version used it and reported this service
+    # `unhealthy` with `pgrep: not found` (exit 127) the whole time the decoy was
+    # publishing correctly — a healthcheck that lies in the alarming direction is
+    # worse than no healthcheck, since it trains you to ignore the indicator.
+    # Exec-form CMD means PID 1 is the decoy itself.
+    healthcheck:
+      test: ["CMD-SHELL", "tr '\\0' ' ' < /proc/1/cmdline | grep -q decoy_ied.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # GOOSE traffic monitor — SPEC.md Section 20.2
+  #
+  # The observer half of Phase 2: captures every GOOSE frame on scada_net and records
+  # it in the shared store with protocol='goose'. GR-1..GR-4 then run against these
+  # rows — SPEC.md 20.2 is explicit that they key off *this* component and "not the
+  # decoy's own receive path".
+  #
+  # It is a separate container from the decoy on purpose. A monitor sharing the
+  # decoy's socket could only see frames addressed to the decoy, which is precisely
+  # the blind spot Section 20.2 calls out; an independent observer on the segment sees
+  # every publisher.
+  #
+  # It reuses the goose image rather than adding a third build with its own pinned
+  # dependency set. The monitor itself needs no libiec61850 — it decodes raw frames
+  # with goose/goose_frame.py — but it writes the same store, so the shared image
+  # costs nothing and keeps one dependency pin rather than two.
+  # ---------------------------------------------------------------------------
+  goose-monitor:
+    build:
+      context: .
+      dockerfile: goose/Dockerfile
+    image: gridsnare-goose
+    container_name: gridsnare-goose-monitor
+    restart: unless-stopped
+    command: ["python", "-u", "goose/goose_monitor.py"]
+
+    # Its own address on scada_net, so it is an independent observer rather than a
+    # second view of the decoy. It is passive — it injects nothing — so it needs no
+    # entry in any allow-list.
+    #
+    # Pinned rather than left to the pool: the other fixed addresses in this file
+    # (decoy .2, PLC .6, test runner .5) must not collide with a dynamically assigned
+    # one, and an observer whose address moves between boots is a variable in a lab
+    # that is otherwise reproducible. This is the address it took from the pool before
+    # it was pinned, so the GOOSE test cases see exactly what they saw before.
+    networks:
+      scada_net:
+        ipv4_address: 172.20.0.4
+
+    # NET_RAW to capture raw Ethernet. No NET_ADMIN: the capture socket joins the GOOSE
+    # multicast group with PACKET_MR_PROMISC, which does not require it (see the note
+    # on the goose service above for how that was measured).
+    cap_add:
+      - NET_RAW
+
+    volumes:
+      # The shared store, read-write: recording GOOSE events is this component's whole
+      # job — unlike the decoy, whose only output is on the wire.
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+
+    # Liveness only, and labelled as such: this asserts the process is alive, not that
+    # frames are reaching the store. Proving capture is what the GOOSE test cases
+    # (TC-7..TC-13) are for.
+    healthcheck:
+      test: ["CMD-SHELL", "tr '\\0' ' ' < /proc/1/cmdline | grep -q goose_monitor.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Test runner — SPEC.md Section 12 (Phase 1) / 20.6 (Phase 2)
+  # Runs tests/test_scenarios.py inside Docker, on the lab network, so the plan
+  # drives the same stack an operator would (README instruction 3: no packages on
+  # the host). Not started by `docker compose up`; use the `test` profile:
+  #
+  #   docker compose --profile test run --rm tests
+  #   docker compose --profile test run --rm tests python -m pytest tests -v -s
+  #
+  # It is a *client* on scada_net: traffic has to cross the bridge to be captured,
+  # so a request sent from the monitor's own namespace would be invisible to the
+  # capture. Its address is therefore fixed and allow-listed as the SPEC Section 11
+  # baseline traffic source.
+  # ---------------------------------------------------------------------------
+  tests:
+    build:
+      context: .
+      dockerfile: tests/Dockerfile
+    container_name: gridsnare-tests
+    profiles: ["test"]
+    depends_on:
+      honeypot:
+        condition: service_started
+      monitor:
+        condition: service_started
+      dashboard:
+        condition: service_started
+      # TC-1 and TC-5 assert on honeypot-sourced rows, which only this service
+      # produces, so the suite should not start ahead of it.
+      honeypot-ingest:
+        condition: service_started
+      # TC-2's baseline targets the legitimate PLC and asserts the tap observed it,
+      # so the suite should not start ahead of either. service_healthy on the PLC for
+      # the same reason the tap waits for it: monitor-plc attaches to the PLC's
+      # namespace, which needs an interface first.
+      plc:
+        condition: service_healthy
+      monitor-plc:
+        condition: service_started
+      # Detection now runs as its own service (see `engine` above), so the suite
+      # depends on it rather than starting one per test. service_healthy so the poll
+      # loop is actually alive before the first case sends traffic.
+      engine:
+        condition: service_healthy
+
+    # scada_net to send Modbus to the decoy; ui_net only to query the dashboard API
+    # for TC-6. It makes no outbound requests (SPEC Section 11: no internet exposure).
+    networks:
+      scada_net:
+        ipv4_address: 172.20.0.5
+      ui_net: {}
+
+    volumes:
+      # The shared store. Mounted read-write because the suite advances the engine
+      # by one poll cycle, and the engine writes its watermark and any alerts —
+      # exactly as it does when the background loop runs.
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+
+volumes:
+  # Conpot's own log, shared between the decoy that writes it and the ingester that
+  # transcribes it (SPEC.md Section 9 step 2). A named volume rather than a path in the
+  # image, because the log is runtime evidence rather than image content.
+  conpot_logs:
+
+networks:
+  # The monitored segment. `internal: true` gives it no gateway to the outside
+  # world, so no service here can reach (or be reached from) a real network — this
+  # is the SPEC Section 4 / Section 11 boundary.
+  scada_net:
+    driver: bridge
+    internal: true
+    # Pinned so the lab is reproducible: the decoy is always 172.20.0.2 (the only
+    # entry in DR-5's allow-list) and the test client is always 172.20.0.5. Docker
+    # would otherwise hand out addresses from a pool and the allow-list would drift.
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+  # The dashboard needs its own network with a gateway, because Docker DROPS
+  # published ports on `internal: true` networks: the port mapping is silently
+  # omitted and the container is unreachable from the host. Verified in this lab —
+  # on scada_net the container listed `ports=5099/tcp` with no host binding and
+  # the request failed, while the identical container on the default bridge
+  # answered HTTP 200.
+  #
+  # Two consequences, both acceptable for a lab and both worth knowing:
+  #   * the dashboard has no adjacency to the monitored segment — it only reads the
+  #     mounted SQLite volume and cannot reach the decoy at all;
+  #   * this network has a gateway, so the container could in principle reach the
+  #     internet, although nothing in the app makes outbound requests. To keep the
+  #     UI completely gateless, run it on scada_net instead and publish from a
+  #     separate forwarding container — at the cost of an extra hop.
+  ui_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24

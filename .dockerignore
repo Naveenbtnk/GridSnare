@@ -1,0 +1,31 @@
+# Keep the build context small. (Build context is the repository root — see
+# docker-compose.yml.) The monitor image copies monitor/, engine/, store.py,
+# modbus_codec.py and config.yaml; the dashboard image copies dashboard/ and
+# config.yaml; the tests image copies tests/, engine/ and config.yaml; the Phase 2
+# goose image (decoy IED + GOOSE traffic monitor) copies goose/, store.py and
+# config.yaml; the honeypot ingester image copies honeypot/, store.py, modbus_codec.py
+# and config.yaml; the legitimate PLC simulator image copies plc/ and config.yaml.
+# Everything else is left out until a service needs it.
+#
+# store.py and modbus_codec.py are at the repository root rather than inside monitor/
+# because more than one image needs the same raw_events schema and the same Modbus
+# decoder, and both must not be excluded here.
+.git
+.gitignore
+.freebuff
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+data/
+docs/
+# honeypot/ is deliberately NOT excluded: the honeypot ingester image builds from this
+# context (honeypot/log_ingest.py). The Conpot decoy itself runs the upstream image and
+# never builds from here.
+# goose/ is deliberately NOT excluded: the goose image builds from this context.
+README*.md
+CLAUDE.md
+# tests/ is deliberately NOT excluded: the tests image builds from this context.

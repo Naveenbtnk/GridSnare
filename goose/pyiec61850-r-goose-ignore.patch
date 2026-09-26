@@ -1,0 +1,17 @@
+--- a/pyiec61850/iec61850.i
++++ b/pyiec61850/iec61850.i
+@@ -1,5 +1,13 @@
+ /* File : iec61850.i */
+ %module(directors="1") pyiec61850
++/* R-GOOSE only. Built without mbedtls, CMake forces CONFIG_IEC61850_R_GOOSE to 0,
++ * so these two functions are never compiled while this interface still declares
++ * them - which produced a module that could not be imported at all:
++ *   ImportError: undefined symbol: GoosePublisher_createRemote
++ * Ignoring them makes the binding match the library that was actually built.
++ * Layer-2 GOOSE, which the decoy publishes, does not use R-GOOSE. */
++%ignore GoosePublisher_createRemote;
++%ignore GooseReceiver_createRemote;
+ %ignore ControlObjectClient_setTestMode(ControlObjectClient self);
+ %ignore CDA_OperBoolean(ModelNode* parent, bool isTImeActivated);
+ %ignore LogicalNode_hasBufferedReports(LogicalNode* node);
+

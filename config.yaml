@@ -1,0 +1,315 @@
+# GridSnare configuration
+#
+# SPEC.md Section 8: "Thresholds (allow-lists, operational hours, polling rate
+# limits) are configurable, not hardcoded — stored in a config.yaml so the system
+# can be tuned without code changes."
+
+# --- Protocol traffic monitor (SPEC.md Section 7.2) -------------------------
+monitor:
+  # TCP ports treated as Modbus protocol traffic.
+  #   5020 = where Conpot's *testing* configuration listens (see docker-compose.yml)
+  #   502  = standard Modbus port, for when the honeypot runs the non-testing template
+  modbus_ports: [5020, 502]
+
+  # Capture interface. The monitor shares the honeypot's network namespace, so
+  # eth0 here is the decoy's link (see docker-compose.yml).
+  interface: eth0
+
+  # Shared SQLite data store (SPEC.md Section 7.4).
+  database: /app/data/events.db
+
+  log_level: INFO
+
+# --- Honeypot interaction ingester (SPEC.md Section 9, step 2) ---------------
+# The other half of the Section 9 data flow: "In parallel, any honeypot interaction
+# is logged to raw_events with source=honeypot". It tails Conpot's own log, which
+# records what the decoy received, decoded and answered — an independent view of the
+# same exchange the wire monitor captured (honeypot/log_ingest.py has the rationale).
+#
+# Without this component DR-1 and DR-7 have no live input: DR-1 fires on
+# source='honeypot' events, and DR-7 correlates a host seen in the honeypot log with
+# the same host in the monitor log.
+honeypot_ingest:
+  # Conpot's log file, written *inside the honeypot container*. docker-compose.yml
+  # mounts the decoy's log directory as the named volume `conpot_logs` and mounts it
+  # read-only here, which is why this same path resolves in this container.
+  log_path: /var/log/conpot/conpot.log
+
+  # The shared SQLite data store (SPEC.md Section 7.4) — the same file the Modbus and
+  # GOOSE traffic monitors write.
+  database: /app/data/events.db
+
+  # Consumed log offset, persisted so a restart resumes where it stopped rather than
+  # replaying the whole log (which would fabricate DR-1 alerts out of history) or
+  # silently skipping whatever happened while this component was down.
+  state_path: /app/data/honeypot_ingest.offset
+
+  # The decoy's identity, used to fill dst_ip/dst_port on a honeypot row. Conpot's log
+  # names the peer only, so the destination comes from configuration rather than being
+  # inferred — and it mirrors the decoy's fixed address in docker-compose.yml
+  # (172.20.0.2) and its listening port in the `monitor:` section above.
+  decoy_address: 172.20.0.2
+  decoy_port: 5020
+
+  # How often to poll for new lines while the log is idle. Conpot appends and flushes
+  # one line per interaction, so this bounds the ingest latency in the quiet case.
+  poll_interval_seconds: 0.5
+
+  log_level: INFO
+
+# --- Legitimate Modbus PLC simulator (SPEC.md Section 11) -------------------
+# Section 11 makes this a required lab component: baseline/legitimate traffic has to
+# target a real asset, because the honeypot has no legitimate traffic by design
+# (Section 7.1) and traffic aimed at it is *correctly* flagged. Before this existed,
+# TC-2 pointed its whitelisted pattern at the decoy and passed only while the decoy's
+# log was not being ingested; once it was, 40 baseline reads produced 80 Critical
+# alerts (40 DR-1 + 40 DR-7). See plc/plc_simulator.py for the full reasoning.
+#
+# Nothing here writes to the shared store and no rule knows this service exists — it
+# is an asset, not part of the detection path, so an alert during TC-2 is a genuine
+# false positive rather than an artefact of aiming a baseline at a decoy.
+plc:
+  # Bind address inside the container. 0.0.0.0 so it is reachable on scada_net; the
+  # service publishes no host ports.
+  bind: "0.0.0.0"
+
+  # Standard Modbus port. This is the decoy's `testing` port (5020) counterpart: the
+  # PLC is a real device, so it listens where real Modbus devices do.
+  port: 502
+
+  # Size of each served address space, and the base value of each register ramp. The
+  # baseline pattern reads holding registers 0..13 and coils 0..7, so the space must
+  # cover those or the PLC answers with "illegal data address" exceptions.
+  address_space: 100
+  holding_register_base: 1000
+  input_register_base: 2000
+
+  log_level: INFO
+
+# --- Automated test plan (SPEC.md Sections 12 / 13, 20.6) ------------------
+# Read by tests/test_scenarios.py. Kept here rather than in the test file so the
+# lab addresses and the baseline pattern stay config-driven like every other knob
+# (SPEC.md Section 8); the suite can also be pointed elsewhere with the matching
+# GRIDSNARE_* environment variables.
+tests:
+  honeypot_host: "172.20.0.2"     # the decoy's fixed address on scada_net
+  honeypot_port: 5020             # Conpot's testing-config Modbus port
+  client_source_ip: "172.20.0.5"  # this runner's fixed address; DR-5 allow-listed
+  database: /app/data/events.db   # the shared store, mounted into the runner
+  dashboard_url: "http://dashboard:5000"
+
+  # TC-2's baseline target (SPEC.md Section 12: "targeting the legitimate PLC
+  # simulator (Section 11) — never the honeypot"). Its fixed address is pinned in
+  # docker-compose.yml for the same reason the decoy's is.
+  plc_host: "172.20.0.6"
+  plc_port: 502
+
+  # TC-2 is "run expected/whitelisted traffic for 10 minutes". The interval keeps
+  # the pattern well under DR-6's requests-per-minute limit, and the runner asserts
+  # that arithmetic before it blames the engine for alerting on the baseline.
+  baseline_seconds: 600
+  baseline_interval_seconds: 15
+
+  # How long to wait for the live monitor to store what the test sent, before
+  # failing with the store's state attached.
+  event_timeout_seconds: 20
+
+# --- Alert dashboard (SPEC.md Section 7.5) ----------------------------------
+# Views: live alert feed, severity breakdown chart, timeline and the honeypot vs.
+# monitor event split. Reads the same store the monitor and engine write.
+dashboard:
+  database: /app/data/events.db
+
+  # Bind address *inside the container*. docker-compose.yml publishes this on
+  # 127.0.0.1 only, because SPEC.md Section 7.5 accepts "no authentication needed
+  # for a local lab demo" and that only stays true if it is not LAN-reachable.
+  host: 0.0.0.0
+  port: 5000
+
+  # SPEC.md Section 9 step 5: "Dashboard queries alerts and raw_events for
+  # display, refreshing on a short interval."
+  refresh_seconds: 3
+
+  feed_limit: 50        # rows in the live alert feed
+  timeline_minutes: 30  # width of the timeline window
+
+  # Windows the viewer can switch the timeline to (minutes). timeline_minutes above
+  # must be one of them, and it is the default. The buttons re-query the store, so
+  # this list is the only place the choice of ranges is defined.
+  timeline_windows: [15, 30, 120]
+
+  # --- sensor health (dashboard's own thresholds, SPEC.md Section 8) ---------
+  # A source, or the engine, that has not been heard from within this window is
+  # reported as stale. Set it above the engine's poll_interval_seconds with margin:
+  # 120s tolerates 24 missed 5s polls, which is a fault rather than jitter.
+  #
+  # These thresholds grade a *health* display only. They never gate detection —
+  # no alert is raised or suppressed because of them.
+  stale_after_seconds: 120
+
+  # Sources that must be reporting for the pipeline to count as healthy. SPEC.md
+  # Section 9 names both; listing them here (rather than in code) means Phase 2's
+  # GOOSE source joins without touching the dashboard.
+  expected_sources: [monitor, honeypot]
+
+  log_level: INFO
+
+# --- Decoy IED — IEC 61850 / GOOSE (SPEC.md Section 20.2) -------------------
+# A fake protection relay. It publishes one GOOSE control block on the lab segment
+# the way a real relay does (a retransmission burst after a state change, decaying
+# to a steady heartbeat) and subscribes to a peer control block the way a relay's
+# other half does.
+#
+# The published identity below is the bait. Everything here — GoCB reference, GoID,
+# APPID, destination MAC — is what an attacker on the segment would learn by
+# watching, and then try to spoof. GR-2 and GR-4 (Section 20.3) key on it, so a
+# change here must be reflected in what those rules treat as known, and the
+# dashboard's protocol tags stay 'goose' either way.
+goose:
+  # The decoy's own link. It holds its own address on scada_net (unlike the Modbus
+  # monitor, which borrows the honeypot's namespace) because it has to inject raw
+  # Ethernet frames, and a container sharing another's namespace cannot be given
+  # its own MAC address.
+  interface: eth0
+  log_level: INFO
+
+  # --- published control block ------------------------------------------------
+  # Naming follows IEC 61850-8-1: <IED>/<LD>/LLN0$GO$<gcbName>, with the GoID a
+  # human-readable tag the relay itself chooses. 'PROT' is the protection logical
+  # device, which is what makes this look like a relay rather than a generic IED.
+  goid: GSDECOY/PROT$gcbProtTrip
+  gocb_ref: GSDECOY/PROT/LLN0$GO$gcbProtTrip
+  dataset_ref: GSDECOY/PROT/LLN0$dsProtTrip
+  conf_rev: 1
+
+  # --- Ethernet framing -------------------------------------------------------
+  # APPID for GOOSE is the IEC 61850-8-1 range 0x0000-0x3FFF; 0x3001 = 12289.
+  app_id: 12289
+  # Destination MAC must sit in the GOOSE multicast block 01-0C-CD-01-00-00 to
+  # 01-0C-CD-01-01-FF, or no real subscriber would ever listen for it.
+  dst_mac: "01:0c:cd:01:00:01"
+  vlan_id: 0
+  vlan_priority: 4
+
+  # --- timing profile --------------------------------------------------------
+  # SPEC.md Section 20.3 GR-3 validates retransmission timing against this profile,
+  # so the shape lives here rather than in code.
+  #
+  # IEC 61850-8-1 behaviour, which is what makes these frames legitimate: on a
+  # state change the publisher sends a fast burst, then decays to a steady
+  # heartbeat. time_allowed_to_live_ms must exceed the heartbeat interval —
+  # otherwise a conforming subscriber times the publisher out between heartbeats,
+  # so it is validated against heartbeat_seconds at startup rather than trusted.
+  retransmission_profile_ms: [10, 20, 40, 80, 160, 320, 640, 1000]
+  heartbeat_seconds: 2.0
+  time_allowed_to_live_ms: 4000
+
+  # --- the protection element this decoy simulates ----------------------------
+  # A relay that never changes state publishes one StNum forever, which is both
+  # unrealistic and useless as bait: StNum is the field an attacker must forge to
+  # inject a trip. The decoy's element operates on a cycle, so StNum advances and
+  # the burst profile is exercised, on the wire, in plain sight.
+  trip_cycle_seconds: 30.0
+  trip_hold_seconds: 4.0
+
+  # --- the peer control block this decoy subscribes to ------------------------
+  # A real relay also *receives* its peers' trip messages. Nothing in this lab
+  # publishes this one, which is the point: the decoy's subscriber is bait too, and
+  # anything that arrives for it did not come from a legitimate relay.
+  subscribed_gocb_ref: GS_DECOY_PEER/PROT/LLN0$GO$gcbPeerTrip
+
+# --- GOOSE traffic monitor (SPEC.md Section 20.2) ---------------------------
+# The observer half of Phase 2: it captures every GOOSE frame on the lab segment and
+# records it in the shared store with protocol='goose'. Deliberately separate from the
+# decoy's own receive path — SPEC.md 20.2 says GR-1 through GR-4 key off this
+# component, "not the decoy's own receive path", because only a segment observer sees
+# what every publisher is saying rather than only what was addressed to it.
+goose_monitor:
+  # The monitor's own link on scada_net. It is a passive observer: it injects nothing
+  # and holds no fixed address, so it needs no entry in any allow-list — only
+  # CAP_NET_RAW and membership of the GOOSE multicast group (which the capture socket
+  # joins for itself).
+  interface: eth0
+
+  # Shared SQLite data store — the same file the Modbus monitor writes (SPEC.md 7.4).
+  database: /app/data/events.db
+
+  log_level: INFO
+
+# --- Anomaly & correlation engine (SPEC.md Sections 7.3, 8 and 9) -----------
+engine:
+  database: /app/data/events.db
+  log_level: INFO
+
+  # SPEC.md Section 9, step 3: "Correlation engine polls raw_events on an
+  # interval, applies DR-1 through DR-7".
+  poll_interval_seconds: 5
+
+  detection:
+    # == DR-2 =================================================================
+    # Modbus function codes expected on this lab network. Anything else is
+    # flagged as protocol misuse or reconnaissance.
+    allowed_function_codes: [1, 2, 3, 4]
+
+    # == DR-3 =================================================================
+    # Address ranges the decoy PLC is expected to serve. Writes landing outside
+    # them are flagged.
+    #
+    # Modbus coils and holding/input registers are separate address spaces, so
+    # they get one range each (SPEC.md Section 8 says "register"; the coil range
+    # is an extension — noted in the README).
+    #
+    # These are LAB DEFAULTS, not measurements: the upstream Conpot default
+    # template does not document its datastore, so correct these once
+    # honeypot/conpot_config/ defines the decoy's real device profile.
+    operational_register_range: [0, 9]
+    operational_coil_range: [0, 7]
+
+    # == DR-4 =================================================================
+    # Expected baseline usage window, evaluated in the configured timezone.
+    # 'days' uses Python weekday numbers (0 = Monday); an empty list means every
+    # day. Timestamps in raw_events are UTC, so conversion happens here rather
+    # than in the monitor.
+    operational_hours:
+      start: "06:00"
+      end: "20:00"
+      days: [0, 1, 2, 3, 4, 5, 6]
+      timezone: "Asia/Kolkata"
+
+    # == DR-5 =================================================================
+    # Devices permitted to talk to the PLC. Anything else is an unrecognised
+    # device on the network. The decoy is the only asset documented so far — add
+    # the HMI / engineering workstation once the baseline traffic source exists.
+    #
+    # 172.20.0.2 = the decoy itself (fixed in docker-compose.yml).
+    # 172.20.0.5 = the test-runner container, i.e. the SPEC.md Section 11 baseline
+    #   traffic source. It has to be here or DR-5 fires on the baseline by design and
+    #   TC-2 cannot demonstrate anything. Ad-hoc `docker run` clients (any other
+    #   address) are unrecognised on purpose — DR-5 firing for them is correct.
+    # 172.20.0.6 = the legitimate PLC simulator (Section 11). It is a known asset and
+    #   is listed as one; the baseline *targets* it, and DR-5 classifies sources, so
+    #   this entry only matters if the PLC itself ever originates traffic.
+    known_asset_allow_list: ["172.20.0.2", "172.20.0.5", "172.20.0.6"]
+
+    # == DR-6 =================================================================
+    # More than polling_rate_limit requests from a single source within
+    # polling_window_seconds is treated as scanning or fuzzing behaviour.
+    polling_rate_limit: 10
+    polling_window_seconds: 60
+
+    # == DR-7 =================================================================
+    # Same source IP appearing in both the honeypot and the monitor logs within
+    # this many minutes is a multi-stage attack indicator.
+    correlation_window_minutes: 5
+
+    # == alert de-duplication =================================================
+    # Per-source, per-rule suppression window, so a chatty or unrecognised host
+    # produces one alert per window instead of one per packet. Applies to DR-4,
+    # DR-5 and DR-6. DR-1, DR-2 and DR-3 are per-event rules and are de-duplicated
+    # by (rule, event) instead.
+    #
+    # DR-7 is deliberately not governed by this any more. It is de-duplicated per
+    # *honeypot interaction* rather than per source host, because keying it on the
+    # host for a 300s window hid a second, separate honeypot hit from a host already
+    # correlated — see engine/correlator.py.
+    alert_cooldown_seconds: 300

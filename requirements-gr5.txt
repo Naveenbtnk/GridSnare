@@ -1,0 +1,10 @@
+# GridSnare — GR-5 autoencoder requirements (SPEC.md 20.3, optional stretch goal)
+#
+# Kept separate from requirements.txt so the test image does not pull in PyTorch:
+# only scripts/train_autoencoder.py and engine/autoencoder.py need these, and they
+# are run explicitly rather than as part of the lab stack.
+#
+#   pip install -r requirements-gr5.txt
+#   python scripts/train_autoencoder.py
+numpy>=1.24
+torch>=2.0

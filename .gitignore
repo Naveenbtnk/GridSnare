@@ -1,0 +1,66 @@
+# ---------------------------------------------------------------------------
+# GridSnare .gitignore (Python + Docker)
+# ---------------------------------------------------------------------------
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# test / type-check / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# notebooks
+.ipynb_checkpoints/
+
+# --- Docker ---
+.docker/
+docker-compose.override.yml
+docker-compose.*.override.yml
+*.pid
+
+# --- Local tooling / secrets ---
+.env
+*.env
+!.env.example
+.freebuff/
+
+# --- Local agent pointer files (not part of the published project) ---
+CLAUDE.md
+
+# --- Generated runtime data ---
+# events.db is created and written by the engine at runtime; data/.gitkeep keeps
+# the directory itself in the repo.
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+# the honeypot ingester's consumed-log offset — runtime bookkeeping, not source
+data/*.offset
+# the trained GR-5 autoencoder — a build artefact, not source
+data/autoencoder.pt
+# SWaT captures are externally sourced and large (~400 MB); drop them in here to
+# run scripts/train_autoencoder.py (see README "Real-world validation").
+data/swat/*.csv

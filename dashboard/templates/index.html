@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GridSnare — live alert dashboard</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='logo.svg') }}">
+  <meta name="color-scheme" content="light">
+  <!-- Chart.js and the typeface are vendored into the image at build time (SPEC.md
+       Section 10: "Dashboard | Flask + Chart.js") so this page renders with no
+       internet access — the lab has none (Section 11). Both are hash-pinned in
+       dashboard/Dockerfile, so a substituted file fails the build. -->
+  <script src="{{ url_for('static', filename='chart.umd.min.js') }}"></script>
+  <style>
+    /* ---------------------------------------------------------------------
+       Light SaaS layout: fixed sidebar, breadcrumb topbar, KPI row, charts,
+       full-width activity table. Near-white page, white cards, hairline
+       borders.
+
+       Colour rule, unchanged: saturated hue is reserved for data meaning —
+       severity, rule id, source — never for decoration. That is why the
+       primary accent is our cyan/indigo pair rather than the reference's
+       green: green already means "Low" in this console (and DR-6), and a
+       second green would make the palette lie.
+       --------------------------------------------------------------------- */
+    @font-face {
+      font-family: "Plus Jakarta Sans";
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+      src: url("{{ url_for('static', filename='fonts/plus-jakarta-sans-latin-400.woff2') }}") format("woff2");
+    }
+    @font-face {
+      font-family: "Plus Jakarta Sans";
+      font-style: normal;
+      font-weight: 500;
+      font-display: swap;
+      src: url("{{ url_for('static', filename='fonts/plus-jakarta-sans-latin-500.woff2') }}") format("woff2");
+    }
+    @font-face {
+      font-family: "Plus Jakarta Sans";
+      font-style: normal;
+      font-weight: 600;
+      font-display: swap;
+      src: url("{{ url_for('static', filename='fonts/plus-jakarta-sans-latin-600.woff2') }}") format("woff2");
+    }
+    @font-face {
+      font-family: "Plus Jakarta Sans";
+      font-style: normal;
+      font-weight: 700;
+      font-display: swap;
+      src: url("{{ url_for('static', filename='fonts/plus-jakarta-sans-latin-700.woff2') }}") format("woff2");
+    }
+
+    :root {
+      --page:       #f7f8fa;
+      --card:       #ffffff;
+
+      --ink:        #0f172a;
+      --ink-2:      #475569;
+      --ink-3:      #64748b;
+      --ink-4:      #94a3b8;
+
+      --line:       #e9edf3;
+      --line-2:     #dde4ee;
+
+      /* accent: our own, see the note at the top of this block */
+      --accent:     #0891b2;
+      --accent-2:   #4f46e5;
+
+      /* data marks (saturated) + their darkened text partners */
+      --rose:       #ff2e63;   --rose-ink:   #b3123c;
+      --orange:     #ff7a00;   --orange-ink: #9a4a00;
+      --amber:      #e0a500;   --amber-ink:  #7a5a00;
+      --mint:       #00c888;   --mint-ink:   #046b4b;
+      --teal:       #00b3a4;   --teal-ink:   #00665e;
+      --cyan:       #00a3c4;   --cyan-ink:   #00637a;
+      --sky:        #38bdf8;   --sky-ink:    #0b6ea8;
+      --indigo:     #4f46e5;   --indigo-ink: #322ca8;
+      --violet:     #7c5cff;   --violet-ink: #5433cc;
+      --magenta:    #e1009f;   --magenta-ink:#a3006f;
+      --slate:      #94a3b8;   --slate-ink:  #4a5666;
+
+      /* fills used behind white text: darkened until the pair passes for large
+         text, so the emphasized card works in every state it can be in */
+      --fill-ok:    #0f8a4d;
+      --fill-warn:  #9a6b00;
+      --fill-bad:   #b3123c;
+      --fill-info:  #3730a3;
+
+      --r-sm: 8px;
+      --r-md: 12px;
+      --r-lg: 16px;
+      --shadow: 0 1px 2px rgba(15,23,42,.04), 0 8px 24px -18px rgba(15,23,42,.28);
+
+      --sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0; background: var(--page); color: var(--ink);
+      font-family: var(--sans); font-size: 13.5px; line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+    h1, h2, h3 { margin: 0; letter-spacing: -.015em; }
+    a { color: inherit; }
+
+    /* ------------------------------ shell ------------------------------ */
+    .app { display: grid; grid-template-columns: 248px minmax(0, 1fr); min-height: 100vh; }
+
+    /* ------------------------------ sidebar ------------------------------ */
+    .sidebar {
+      position: sticky; top: 0; align-self: start; height: 100vh;
+      display: flex; flex-direction: column; gap: 14px;
+      padding: 18px 14px; background: var(--card);
+      border-right: 1px solid var(--line); overflow-y: auto;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; padding: 2px 6px 0; }
+    .mark {
+      position: relative; width: 34px; height: 34px; flex: none; border-radius: 10px;
+      display: grid; place-items: center;
+      font: 700 12px/1 var(--sans); letter-spacing: .04em; color: #fff;
+      background: linear-gradient(165deg, #18263f 0%, #0b1220 100%);
+      box-shadow: 0 4px 12px -6px rgba(15,23,42,.6);
+    }
+    /* the severity spectrum on the mark's edge — the same four colours the feed
+       sorts by, so the accent is a key rather than decoration */
+    .mark::after {
+      content: ""; position: absolute; left: 6px; right: 6px; bottom: -1.5px; height: 2.5px;
+      border-radius: 2px;
+      background: linear-gradient(90deg, var(--rose), var(--orange), var(--amber), var(--mint));
+    }
+    .mark svg { width: 21px; height: 21px; display: block; }
+    .mark .node { fill: var(--cyan); }
+    .wordmark { font-size: 15.5px; font-weight: 700; letter-spacing: -.02em; }
+    .wordmark span { display: block; font-size: 10.5px; font-weight: 500; color: var(--ink-3); letter-spacing: 0; }
+
+    .search-wrap { position: relative; padding: 0 2px; }
+    .search-wrap svg { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--ink-4); }
+    .search {
+      width: 100%; padding: 8px 10px 8px 30px; font: 500 12.5px var(--sans); color: var(--ink);
+      background: #f8fafc; border: 1px solid var(--line-2); border-radius: var(--r-sm);
+    }
+    .search::placeholder { color: var(--ink-4); }
+    .search:focus { outline: 2px solid rgba(8,145,178,.35); border-color: var(--accent); background: #fff; }
+    .search-hint { margin: 5px 2px 0; font-size: 10px; color: var(--ink-4); }
+
+    .nav { display: flex; flex-direction: column; gap: 2px; padding: 0 2px; }
+    .nav-label {
+      margin: 12px 0 5px 8px; font-size: 9.5px; font-weight: 700;
+      letter-spacing: .14em; text-transform: uppercase; color: var(--ink-4);
+    }
+    .nav-item {
+      display: flex; align-items: center; gap: 9px; padding: 8px 10px;
+      border-radius: var(--r-sm); font-size: 13px; font-weight: 500; color: var(--ink-2);
+      text-decoration: none; cursor: pointer; border: 1px solid transparent;
+      white-space: nowrap;
+    }
+    .nav-item:hover { background: #f4f7fa; color: var(--ink); }
+    .nav-item.active { background: #eef2f7; color: var(--ink); font-weight: 600; border-color: var(--line-2); }
+    .nav-item .nav-icon { width: 15px; height: 15px; flex: none; color: var(--ink-4); }
+    .nav-item.active .nav-icon { color: var(--accent); }
+    .nav-count {
+      margin-left: auto; font: 600 10.5px var(--mono); color: var(--ink-3);
+      background: #eef2f7; border-radius: 999px; padding: 1px 7px;
+      flex: none; max-width: 96px; overflow: hidden; text-overflow: ellipsis;
+    }
+    .nav-item.active .nav-count { background: #fff; }
+
+    /* live pipeline rows in the sidebar — real state, not a promo card */
+    .side-status { margin-top: auto; display: flex; flex-direction: column; gap: 7px; padding: 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: #fcfdfe; }
+    .side-status h3 { font-size: 10px; letter-spacing: .13em; text-transform: uppercase; color: var(--ink-4); font-weight: 700; }
+    .side-row { display: flex; align-items: center; gap: 8px; font: 500 11.5px var(--mono); color: var(--ink-2); }
+    .side-row i { width: 7px; height: 7px; border-radius: 50%; background: var(--hmark, var(--slate)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--hmark, var(--slate)) 18%, transparent); flex: none; }
+    .side-row b { font-weight: 600; color: var(--ink); }
+    .side-row small { margin-left: auto; color: var(--ink-3); font-weight: 500; }
+    .side-foot { padding: 0 4px; font-size: 10.5px; line-height: 1.6; color: var(--ink-4); }
+    .side-foot code { font: 500 10px var(--mono); color: var(--ink-3); }
+
+    /* ------------------------------ main column ------------------------------ */
+    .main { min-width: 0; padding: 0 28px 44px; }
+
+    .topbar {
+      position: sticky; top: 0; z-index: 5;
+      display: flex; align-items: center; gap: 16px;
+      margin: 0 -28px 20px; padding: 14px 28px;
+      background: rgba(247,248,250,.92); backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--line);
+    }
+    .crumbs { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-3); }
+    .crumbs b { color: var(--ink); font-weight: 600; }
+    .topbar-meta { display: flex; align-items: center; gap: 18px; margin-left: auto; }
+    .meta-item { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .meta-label { font-size: 9px; letter-spacing: .13em; text-transform: uppercase; color: var(--ink-4); font-weight: 700; }
+    .meta-value { font: 500 11.5px/1.2 var(--mono); color: var(--ink-2); }
+    .link-state { display: inline-flex; align-items: center; gap: 6px; font: 500 11.5px var(--mono); color: var(--ink-2); }
+    .link-state i { width: 7px; height: 7px; border-radius: 50%; background: var(--slate); transition: background .2s, box-shadow .2s; }
+    .link-state.live i { background: var(--mint); box-shadow: 0 0 0 3px rgba(0,200,136,.18); }
+    .link-state.stale i { background: var(--amber); box-shadow: 0 0 0 3px rgba(224,165,0,.2); }
+
+    /* the reference's primary CTA, repurposed as a real control: it reports the
+       detection state and jumps to the panel that explains it */
+    .cta {
+      display: inline-flex; align-items: center; gap: 8px; padding: 9px 14px;
+      border-radius: var(--r-sm); font-size: 12.5px; font-weight: 600;
+      color: #fff; background: var(--fill-info); border: 0; cursor: pointer;
+      box-shadow: 0 6px 16px -10px rgba(15,23,42,.6);
+    }
+    .cta:hover { filter: brightness(1.06); }
+
+    .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; flex-wrap: wrap; margin-bottom: 16px; }
+    .page-head h1 { font-size: 21px; font-weight: 700; }
+    .page-head p { margin: 3px 0 0; font-size: 12.5px; color: var(--ink-3); }
+    .page-tools { display: flex; align-items: center; gap: 9px; }
+
+    .segmented { display: inline-flex; padding: 3px; gap: 2px; background: #eef2f7; border-radius: var(--r-sm); border: 1px solid var(--line); }
+    .segmented button {
+      border: 0; background: transparent; cursor: pointer; border-radius: 6px;
+      padding: 6px 11px; font: 600 11.5px var(--sans); color: var(--ink-3);
+    }
+    .segmented button:hover { color: var(--ink); }
+    .segmented button[aria-pressed="true"] { background: #fff; color: var(--ink); box-shadow: 0 1px 2px rgba(15,23,42,.08); }
+
+    .ghost {
+      display: inline-flex; align-items: center; gap: 7px; padding: 8px 12px;
+      background: #fff; border: 1px solid var(--line-2); border-radius: var(--r-sm);
+      font: 600 12px var(--sans); color: var(--ink-2); cursor: pointer;
+    }
+    .ghost:hover { background: #f8fafc; color: var(--ink); }
+    .ghost[disabled] { opacity: .5; cursor: default; }
+
+    /* ------------------------------ cards ------------------------------ */
+    .card {
+      background: var(--card); border: 1px solid var(--line);
+      border-radius: var(--r-md); box-shadow: var(--shadow); padding: 17px 18px;
+    }
+    .section { scroll-margin-top: 76px; margin-bottom: 16px; }
+    .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+    .card-head h2 { font-size: 15px; font-weight: 700; }
+    .card-head p { margin: 2px 0 0; font-size: 11.5px; color: var(--ink-3); }
+    .eyebrow { font: 700 9.5px var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--ink-4); }
+    .caption { font: 400 11px var(--mono); color: var(--ink-3); }
+
+    /* ------------------------------ KPI row ------------------------------ */
+    .kpis { display: grid; grid-template-columns: 1.25fr 1fr 1fr; gap: 14px; margin-bottom: 16px; }
+    .kpi { display: flex; flex-direction: column; gap: 12px; padding: 16px 17px; }
+    .kpi-top { display: flex; align-items: flex-start; gap: 11px; }
+    .kpi-icon {
+      width: 34px; height: 34px; border-radius: 10px; flex: none;
+      display: grid; place-items: center; background: #f1f5f9; color: var(--ink-2);
+    }
+    .kpi-title { font-size: 13.5px; font-weight: 600; }
+    .kpi-sub { font-size: 11.5px; color: var(--ink-3); margin-top: 1px; }
+    .kpi-value { font-size: 28px; font-weight: 700; letter-spacing: -.03em; font-variant-numeric: tabular-nums; line-height: 1.1; }
+    .kpi-foot {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      margin-top: auto; padding-top: 12px; border-top: 1px solid var(--line);
+      font-size: 12px; font-weight: 600; color: var(--ink-2);
+    }
+    .kpi-foot a { text-decoration: none; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+    .kpi-foot a:hover { color: var(--accent-ink, #0e7490); }
+    .delta {
+      display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 999px;
+      font: 600 11px var(--mono); color: var(--mint-ink); background: rgba(0,200,136,.12);
+    }
+    .delta.neutral { color: var(--ink-3); background: #f1f5f9; }
+
+    /* emphasized card: filled from the *state*, so it changes colour when
+       detection stops instead of staying decorative green */
+    .kpi-primary { color: #fff; border: 0; background: var(--fill, var(--fill-info)); }
+    .kpi-primary .kpi-title { font-size: 15px; }
+    .kpi-primary .kpi-sub { color: rgba(255,255,255,.86); font-size: 12px; }
+    .kpi-primary .kpi-value { font-size: 26px; }
+    .kpi-primary .kpi-icon { background: rgba(255,255,255,.18); color: #fff; }
+    .kpi-primary .kpi-foot { border-top-color: rgba(255,255,255,.24); color: #fff; }
+    .kpi-primary .kpi-foot a:hover { color: #fff; text-decoration: underline; }
+    /* `.caption` is grey (--ink-3, #64748b) for use on white. On a filled card that
+       is roughly 1.2:1 — effectively invisible — so anything inside the emphasized
+       card takes the card's own text colour. */
+    .kpi-primary .kpi-foot .caption,
+    .kpi-primary .kpi-foot em {
+      color: rgba(255,255,255,.9); font-style: normal;
+    }
+
+    /* ------------------------------ health ------------------------------ */
+    .pstate {
+      display: flex; align-items: flex-start; gap: 11px; margin-bottom: 13px;
+      padding: 12px 14px; border-radius: var(--r-sm);
+      background: var(--pstate-bg, #f8fafc);
+      border: 1px solid var(--pstate-line, var(--line-2));
+      border-left: 3px solid var(--pstate-mark, var(--slate));
+    }
+    .pstate[hidden] { display: none; }
+    .pstate > i { margin-top: 4px; width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--pstate-mark); }
+    .pstate.alert > i { animation: throb 1.6s ease-in-out infinite; }
+    .pstate-label { font-size: 13px; font-weight: 700; color: var(--pstate-ink, var(--ink)); }
+    .pstate-text { margin: 3px 0 0; font-size: 12.5px; color: var(--ink-2); }
+    @keyframes throb { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+
+    .health { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+    .hrow {
+      display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 5px 9px;
+      padding: 11px 13px; border: 1px solid var(--line); border-radius: var(--r-sm); background: #fcfdfe;
+    }
+    .hrow > i { width: 8px; height: 8px; border-radius: 50%; background: var(--hmark, var(--slate)); }
+    .hrow.alert > i { animation: throb 1.6s ease-in-out infinite; }
+    .hname { font: 600 12px var(--mono); }
+    .hfact { grid-column: 2 / 4; font: 500 10.5px var(--mono); color: var(--ink-3); }
+
+    /* ------------------------------ chips ------------------------------ */
+    .chip {
+      display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 999px;
+      font: 600 10.5px var(--mono); color: var(--chip-ink, var(--ink-2));
+      background: var(--chip-bg, #f1f5f9); border: 1px solid var(--chip-line, transparent);
+      white-space: nowrap;
+    }
+    .chip i { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--chip-mark, var(--slate)); }
+
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    /* Chart.js writes an inline pixel width onto the <canvas> once it has drawn,
+       and a `1fr` track cannot shrink below its item's min-content width — so
+       without this the two-up row grows past its column and the whole page gains
+       a horizontal scrollbar (measured: 1414px of track inside a 1175px column at
+       a 1440px viewport). `min-width: 0` lets the tracks shrink; the max-width
+       keeps the canvas itself inside its box. */
+    .grid-2 > *, .kpis > * { min-width: 0; }
+    .chart-box { position: relative; height: 236px; }
+    .chart-box.tall { height: 248px; }
+    .chart-box canvas { max-width: 100%; }
+
+    /* ------------------------------ filters + table ------------------------------ */
+    .filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .filter-chip {
+      display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; cursor: pointer;
+      background: #fff; border: 1px solid var(--line-2); border-radius: 999px;
+      font: 600 11.5px var(--sans); color: var(--ink-2);
+    }
+    .filter-chip:hover { background: #f8fafc; }
+    .filter-chip[aria-pressed="true"] { color: var(--chip-ink, #fff); background: var(--chip-bg, var(--accent)); border-color: var(--chip-line, var(--accent)); }
+    .filter-chip i { width: 7px; height: 7px; border-radius: 50%; background: var(--chip-mark, var(--slate)); }
+    select.filter-chip, input.filter-chip { cursor: pointer; }
+    .feed-wrap { max-height: 520px; overflow: auto; margin: 0 -18px -17px; padding: 0 18px; border-top: 1px solid var(--line); }
+    table { width: 100%; min-width: 1030px; border-collapse: separate; border-spacing: 0; font-size: 12.5px; }
+    thead th {
+      position: sticky; top: 0; z-index: 2; text-align: left; padding: 10px 12px;
+      font: 700 9.5px var(--sans); letter-spacing: .12em; text-transform: uppercase; color: var(--ink-4);
+      background: #fbfcfe; border-bottom: 1px solid var(--line-2);
+    }
+    tbody td { padding: 11px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    tbody tr:hover td { background: #fafcfe; }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody td:first-child { box-shadow: inset 3px 0 0 var(--dot, transparent); padding-left: 13px; }
+    .mono { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); white-space: nowrap; }
+    .desc { color: var(--ink-2); line-height: 1.45; }
+    .rowid { font: 600 11px var(--mono); color: var(--ink-3); }
+    .copy {
+      display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 26px;
+      background: #fff; border: 1px solid var(--line-2); border-radius: 7px; cursor: pointer; color: var(--ink-3);
+    }
+    .copy:hover { color: var(--ink); background: #f8fafc; }
+    .copy.done { color: var(--mint-ink); border-color: rgba(0,200,136,.4); background: rgba(0,200,136,.1); }
+    .empty { padding: 26px 12px; text-align: center; color: var(--ink-3); font-size: 12.5px; }
+    .notice {
+      margin-bottom: 16px; padding: 12px 15px; font-size: 12.5px; color: var(--ink-2);
+      background: #fffbeb; border: 1px solid rgba(224,165,0,.4); border-left: 3px solid var(--amber);
+      border-radius: var(--r-sm);
+    }
+    .notice[hidden] { display: none; }
+
+    footer.notes { margin-top: 22px; font-size: 11.5px; line-height: 1.75; color: var(--ink-3); }
+    footer.notes strong { color: var(--ink-2); font-weight: 600; }
+    code {
+      font: 500 11px var(--mono); color: var(--violet-ink);
+      background: rgba(124,92,255,.10); border: 1px solid rgba(124,92,255,.22);
+      border-radius: 5px; padding: 1px 5px;
+    }
+
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+
+    @media (max-width: 1180px) {
+      .kpis { grid-template-columns: 1fr 1fr; }
+      .kpi-primary { grid-column: span 2; }
+    }
+    @media (max-width: 900px) {
+      .app { grid-template-columns: 1fr; }
+      .sidebar { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      .nav { flex-direction: row; flex-wrap: wrap; }
+      .nav-label { width: 100%; }
+      .grid-2 { grid-template-columns: 1fr; }
+      .main { padding: 0 16px 36px; }
+      .topbar { margin: 0 -16px 16px; padding: 12px 16px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+      html { scroll-behavior: auto; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <!-- ------------------------------ sidebar ------------------------------ -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2.6 19.3 5.5v6.3c0 4.6-3 8.2-7.3 9.9-4.3-1.7-7.3-5.3-7.3-9.9V5.5Z"
+                  stroke="rgba(255,255,255,.95)" stroke-width="1.5"/>
+            <circle cx="12" cy="11.9" r="3.4" stroke="rgba(255,255,255,.72)" stroke-width="1.4"/>
+            <path d="M12 7.7v8.4M7.8 11.9h8.4" stroke="rgba(255,255,255,.42)" stroke-width="1.3"/>
+            <circle class="node" cx="12" cy="11.9" r="1.2"/>
+          </svg>
+        </div>
+        <div class="wordmark">GridSnare<span>SCADA deception lab</span></div>
+      </div>
+
+      <div class="search-wrap">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
+          <circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path>
+        </svg>
+        <input id="search" class="search" type="search" placeholder="Search alerts…" autocomplete="off"
+               aria-label="Search the loaded alerts">
+      </div>
+      <p class="search-hint" id="search-hint">filters the loaded rows</p>
+
+      <nav class="nav" id="nav" aria-label="Dashboard sections">
+        <span class="nav-label">Main menu</span>
+        <a class="nav-item" href="#overview" data-target="overview">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"></rect><rect x="14" y="3" width="7" height="5" rx="1.5"></rect><rect x="14" y="12" width="7" height="9" rx="1.5"></rect><rect x="3" y="16" width="7" height="5" rx="1.5"></rect></svg>
+          Overview
+        </a>
+        <a class="nav-item" href="#health" data-target="health">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l2.5-6 4 12 2.5-6h5"></path></svg>
+          Sensor health
+          <span class="nav-count" id="nav-health">—</span>
+        </a>
+        <a class="nav-item" href="#sources" data-target="sources">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h10"></path></svg>
+          Sources
+          <span class="nav-count" id="nav-sources">—</span>
+        </a>
+        <a class="nav-item" href="#timeline" data-target="timeline">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5M4 19h16"></path><rect x="7" y="11" width="3" height="5" rx="1"></rect><rect x="12" y="7" width="3" height="9" rx="1"></rect><rect x="17" y="13" width="3" height="3" rx="1"></rect></svg>
+          Timeline
+        </a>
+        <a class="nav-item" href="#alerts" data-target="alerts">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l9 16H3l9-16z"></path><path d="M12 9v5M12 16.5v.5"></path></svg>
+          Live alerts
+          <span class="nav-count" id="nav-alerts">—</span>
+        </a>
+      </nav>
+
+      <div class="side-status" id="side-status">
+        <h3>Pipeline</h3>
+        <div id="side-rows"></div>
+      </div>
+
+      <div class="side-foot">
+        <div>Read-only: <code id="db-path">{{ payload.database }}</code></div>
+        <div>No authentication — local lab demo (SPEC.md Section 7.5).</div>
+      </div>
+    </aside>
+
+    <!-- ------------------------------ main ------------------------------ -->
+    <main class="main">
+      <div class="topbar">
+        <div class="crumbs"><b>GridSnare</b> <span>›</span> <span>Dashboard</span></div>
+        <div class="topbar-meta">
+          <div class="meta-item">
+            <span class="meta-label">Updated</span>
+            <span class="meta-value" id="last-updated">—</span>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Refresh</span>
+            <span class="meta-value" id="refresh-every">{{ payload.refresh_seconds }}s</span>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Link</span>
+            <span class="link-state" id="link-state"><i></i><span id="link-state-text">connecting</span></span>
+          </div>
+          <button class="cta" id="cta" type="button">
+            <span id="cta-text">Detection</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"></path></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="page-head">
+        <div>
+          <h1>Overview</h1>
+          <p>Live detections from the honeypot and the Modbus traffic monitor.</p>
+        </div>
+        <div class="page-tools">
+          <div class="segmented" id="window-control" role="group" aria-label="Timeline window"></div>
+          <button class="ghost" id="clear-filters" type="button" disabled>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M4 4l16 16M20 4L4 20"></path></svg>
+            Clear filters
+          </button>
+        </div>
+      </div>
+
+      <div id="notice" class="notice" hidden></div>
+
+      <!-- KPI row -->
+      <section class="kpis section" id="overview" aria-label="Headline counts">
+        <article class="card kpi kpi-primary" id="kpi-detection">
+          <div class="kpi-top">
+            <span class="kpi-icon" aria-hidden="true">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3z"></path></svg>
+            </span>
+            <div>
+              <div class="kpi-title" id="detection-label">Detection</div>
+              <div class="kpi-sub" id="detection-sub">waiting for the first poll…</div>
+            </div>
+          </div>
+          <div class="kpi-value" id="detection-value">—</div>
+          <div class="kpi-foot">
+            <a href="#health" data-scroll="health">Sensor health</a>
+            <span class="caption" id="detection-meta">—</span>
+          </div>
+        </article>
+
+        <article class="card kpi">
+          <div class="kpi-top">
+            <span class="kpi-icon" aria-hidden="true">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l9 16H3l9-16z"></path><path d="M12 9v5M12 16.5v.5"></path></svg>
+            </span>
+            <div>
+              <div class="kpi-title">Alerts</div>
+              <div class="kpi-sub">Detections written to the alerts table</div>
+            </div>
+          </div>
+          <div class="kpi-value" id="kpi-alerts">—</div>
+          <div class="kpi-foot">
+            <a href="#alerts" data-scroll="alerts">View feed</a>
+            <span class="delta" id="kpi-correlated">—</span>
+          </div>
+        </article>
+
+        <article class="card kpi">
+          <div class="kpi-top">
+            <span class="kpi-icon" aria-hidden="true">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"></path></svg>
+            </span>
+            <div>
+              <div class="kpi-title">Events captured</div>
+              <div class="kpi-sub" id="kpi-split">—</div>
+            </div>
+          </div>
+          <div class="kpi-value" id="kpi-events">—</div>
+          <div class="kpi-foot">
+            <a href="#sources" data-scroll="sources">View sources</a>
+            <span class="caption" id="kpi-store">—</span>
+          </div>
+        </article>
+      </section>
+
+      <!-- sensor health -->
+      <section class="card section" id="health" aria-label="Sensor health">
+        <div class="card-head">
+          <div>
+            <div class="eyebrow">Pipeline</div>
+            <h2>Sensor health</h2>
+            <p>Whether each source is still reporting, and where detection has got to.</p>
+          </div>
+          <span class="caption" id="pipeline-caption"></span>
+        </div>
+        <div class="pstate" id="pipeline-banner" role="status" aria-live="polite" hidden>
+          <i aria-hidden="true"></i>
+          <div>
+            <div class="pstate-label" id="pipeline-label"></div>
+            <p class="pstate-text" id="pipeline-summary"></p>
+          </div>
+        </div>
+        <div class="health" id="health-rows"></div>
+      </section>
+
+      <!-- charts -->
+      <section class="grid-2 section" aria-label="Breakdowns">
+        <article class="card" id="severity-card">
+          <div class="card-head">
+            <div>
+              <div class="eyebrow">Detection</div>
+              <h2>Severity breakdown</h2>
+            </div>
+            <span class="caption">DR-1 – DR-7</span>
+          </div>
+          <div class="chart-box"><canvas id="severity-chart"></canvas></div>
+        </article>
+
+        <article class="card" id="sources">
+          <div class="card-head">
+            <div>
+              <div class="eyebrow">Sources</div>
+              <h2>Honeypot vs. monitor events</h2>
+            </div>
+            <span class="caption">raw_events.source</span>
+          </div>
+          <div class="chart-box"><canvas id="source-chart"></canvas></div>
+        </article>
+      </section>
+
+      <!-- timeline -->
+      <section class="card section" id="timeline" aria-label="Alert timeline">
+        <div class="card-head">
+          <div>
+            <div class="eyebrow">Activity</div>
+            <h2>Alert timeline</h2>
+          </div>
+          <span class="caption" id="timeline-caption"></span>
+        </div>
+        <div class="chart-box tall"><canvas id="timeline-chart"></canvas></div>
+      </section>
+
+      <!-- feed -->
+      <section class="card section" id="alerts" aria-label="Live alerts">
+        <div class="card-head">
+          <div>
+            <div class="eyebrow">Feed</div>
+            <h2>Live alerts</h2>
+            <p id="feed-caption"></p>
+          </div>
+          <div class="filters" id="filters"></div>
+        </div>
+        <div class="feed-wrap">
+          <table>
+            <caption class="eyebrow" style="text-align:left;padding:10px 12px">Alerts raised, newest first</caption>
+            <thead>
+              <tr>
+                <th scope="col">Raised</th><th scope="col">Severity</th><th scope="col">Rule</th>
+                <th scope="col">Protocol</th><th scope="col">Source</th><th scope="col">Target</th>
+                <th scope="col">ID</th><th scope="col">Detection</th><th scope="col"><span class="eyebrow">Copy</span></th>
+              </tr>
+            </thead>
+            <tbody id="feed-body"></tbody>
+          </table>
+          <div id="feed-empty" class="empty">No alerts in the store.</div>
+        </div>
+      </section>
+
+      <footer class="notes">
+        <strong>How to read this.</strong> Rule IDs are from SPEC.md Section 8, and each rule carries its
+        own colour in the feed. A <span class="chip" style="--chip-mark:#7c5cff;--chip-line:rgba(124,92,255,.3);--chip-bg:rgba(124,92,255,.1);--chip-ink:#5433cc">correlated</span>
+        mark is DR-7: one source IP in both the honeypot log and the monitor log inside the correlation window.
+        <strong>Every figure comes from the shared SQLite store</strong> — nothing here is sample data.
+        The search box and the filters act on the alerts already loaded on this page, not on the whole store.
+        Timeline bars are bucketed per minute in UTC and labelled in this browser's local time; quiet minutes
+        are plotted as zero rather than skipped.
+        <br>
+        <strong>Limitation (SPEC.md Section 7.5):</strong> no authentication — this is a local lab demo and
+        must not be exposed beyond localhost.
+      </footer>
+    </main>
+  </div>
+
+  <!-- Server-rendered first paint, so the page shows real store contents even
+       before the first poll completes. -->
+  <script>window.GRIDSNARE = {{ payload | tojson }};</script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=layout-saas"></script>
+</body>
+</html>

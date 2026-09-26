@@ -1,0 +1,14 @@
+# GridSnare — test-runner requirements (SPEC.md Section 12 / 20.6)
+#
+# These are the dependencies of the automated test suite, installed into the
+# `tests` image (see tests/Dockerfile). They are deliberately NOT installed on the
+# host: README instruction 3 says every dependency lives in a service's Dockerfile.
+#
+#   pytest  - runs tests/test_scenarios.py
+#   pyyaml  - the tests read config.yaml, so thresholds stay config-driven
+#
+# The service images pin their own runtime dependencies inline in their
+# Dockerfiles (monitor: scapy; dashboard: flask + pyyaml), because each service
+# needs a different subset and an image should not carry what it does not use.
+pytest==8.4.2
+PyYAML==6.0.3
