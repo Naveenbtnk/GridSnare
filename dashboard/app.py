@@ -72,6 +72,7 @@ class DashboardConfig:
     timeline_windows: Tuple[int, ...]
     stale_after_seconds: int
     expected_sources: Tuple[str, ...]
+    historical_sources: Tuple[str, ...]
     log_level: str
 
     @classmethod
@@ -107,6 +108,21 @@ class DashboardConfig:
                 )
             cleaned_sources.append(name.strip())
 
+        # Sources that are replayed from a historical dataset rather than captured
+        # live. Optional, so the default (none) matches a stack that never replays.
+        historical = section.get("historical_sources", [])
+        if not isinstance(historical, (list, tuple)):
+            raise ConfigError(
+                "dashboard.historical_sources must be a list of source names"
+            )
+        cleaned_historical: List[str] = []
+        for name in historical:
+            if not isinstance(name, str) or not name.strip():
+                raise ConfigError(
+                    f"dashboard.historical_sources entries must be non-empty strings, got {name!r}"
+                )
+            cleaned_historical.append(name.strip())
+
         return cls(
             database=database,
             host=str(section.get("host") or "0.0.0.0"),
@@ -119,6 +135,7 @@ class DashboardConfig:
                 section.get("stale_after_seconds", 120), "stale_after_seconds"
             ),
             expected_sources=tuple(cleaned_sources),
+            historical_sources=tuple(dict.fromkeys(cleaned_historical)),
             log_level=str(section.get("log_level") or "INFO").upper(),
         )
 
@@ -390,10 +407,20 @@ def fetch_pipeline(
         latest_event_id = int(top["latest"] or 0)
         events_total = int(top["n"] or 0)
 
+    # Historical sources are bounded replays: their rows carry the timestamp of
+    # the dataset they came from, not the moment they were stored, so age against
+    # the wall clock is meaningless for them. Grading them on freshness would raise
+    # a permanent, false fault (see dashboard.historical_sources), so they are held
+    # out of the graded list below and reported separately, never as a fault.
+    historical_names = set(config.historical_sources)
+
     # Expected sources keep their configured order; anything else the store has
     # seen is appended, because data in the store beats a list in a config file.
-    names = list(config.expected_sources)
-    names += sorted(name for name in observed if name not in config.expected_sources)
+    names = [name for name in config.expected_sources if name not in historical_names]
+    names += sorted(
+        name for name in observed
+        if name not in config.expected_sources and name not in historical_names
+    )
 
     sources: List[Dict[str, Any]] = []
     for name in names:
@@ -408,6 +435,22 @@ def fetch_pipeline(
                 "age_text": humanise_age(age) if entry["count"] else "never",
                 "state": source_state(entry["count"], age, stale_after),
                 "expected": name in config.expected_sources,
+            }
+        )
+
+    # Replayed sources are still shown, just not graded. Hiding them entirely would
+    # leave the event totals — which do count them — unexplainable on the page.
+    historical: List[Dict[str, Any]] = []
+    for name in config.historical_sources:
+        entry = observed.get(name, {"count": 0, "last": None})
+        age = age_seconds(entry["last"], now)
+        historical.append(
+            {
+                "source": name,
+                "events": entry["count"],
+                "last_event": entry["last"],
+                "age_seconds": age,
+                "age_text": humanise_age(age) if entry["count"] else "never",
             }
         )
 
@@ -565,7 +608,9 @@ def fetch_pipeline(
         "checked_at": utc_iso(now),
         "stale_after_seconds": stale_after,
         "expected_sources": list(config.expected_sources),
+        "historical_sources": list(config.historical_sources),
         "sources": sources,
+        "historical": historical,
         "engine": engine,
         "alerts": {
             "total": alerts_total,
@@ -600,7 +645,9 @@ def starting_pipeline(config: DashboardConfig) -> Dict[str, Any]:
         "checked_at": utc_iso(datetime.now(timezone.utc)),
         "stale_after_seconds": config.stale_after_seconds,
         "expected_sources": list(config.expected_sources),
+        "historical_sources": list(config.historical_sources),
         "sources": [],
+        "historical": [],
         "engine": {
             "state": "never_run", "watermark": None, "watermark_text": "none",
             "latest_event_id": 0,
@@ -725,6 +772,15 @@ def create_app(config: DashboardConfig) -> Flask:
                         "events": entry["events"],
                     }
                     for entry in pipeline["sources"]
+                },
+                # Replayed sources: reported for completeness, deliberately
+                # without a state, because freshness does not apply to them.
+                "historical_sources": {
+                    entry["source"]: {
+                        "age_seconds": entry["age_seconds"],
+                        "events": entry["events"],
+                    }
+                    for entry in pipeline.get("historical", [])
                 },
                 "engine": pipeline["engine"]["state"],
                 "unjudged_events": pipeline["engine"]["lag_events"],

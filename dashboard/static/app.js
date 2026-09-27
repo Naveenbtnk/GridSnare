@@ -32,6 +32,11 @@
     monitor:  { mark: "#00a3c4", ink: "#00637a", label: "Monitor (capture) events" }
   };
 
+  /* Bounded historical replays (e.g. swat_replay). They are shown so the event
+     totals add up, but carry the dataset's own timestamps rather than capture
+     time, so they are never graded fresh/stale and never throb as a fault. */
+  var HISTORICAL = { mark: "#94a3b8", ink: "#4a5666", label: "historical replay" };
+
   var RULES = {
     "DR-1": { mark: "#ff2e63", ink: "#b3123c" },
     "DR-2": { mark: "#ff7a00", ink: "#9a4a00" },
@@ -349,6 +354,10 @@
       }
       host.appendChild(healthRow("engine", engineToken, engineFact, !!engine.fault));
     }
+    (pipeline.historical || []).forEach(function (entry) {
+      var fact = entry.events + " event(s) · historical replay, not freshness-graded";
+      host.appendChild(healthRow(entry.source, HISTORICAL, fact, false));
+    });
 
     // Sidebar mirror of the same state, so the nav area is never decorative.
     var side = el("side-rows");

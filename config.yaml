@@ -152,6 +152,16 @@ dashboard:
   # GOOSE source joins without touching the dashboard.
   expected_sources: [monitor, honeypot]
 
+  # Sources whose rows carry a *historical* event timestamp rather than the moment
+  # they were captured, and are therefore never graded on freshness. swat_replay is
+  # a bounded, one-time replay of a 2015 SWaT dataset (see engine/autoencoder.py and
+  # the README's "Real-world validation"): its newest row is years old by design, so
+  # grading it against stale_after_seconds would raise a permanent, false "capture
+  # path looks broken" fault even while every live source is reporting. These
+  # sources are still shown in the Sensor health panel, just without a state.
+  # Must not overlap expected_sources.
+  historical_sources: [swat_replay]
+
   log_level: INFO
 
 # --- Decoy IED — IEC 61850 / GOOSE (SPEC.md Section 20.2) -------------------
