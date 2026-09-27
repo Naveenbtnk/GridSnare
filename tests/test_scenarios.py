@@ -890,3 +890,103 @@ def test_tc6_dashboard_accuracy(settings: Settings, store: sqlite3.Connection,
         f"feed rows differ: dashboard {feed_ids[:10]}... vs newest "
         f"{expected_feed[:10]}... (feed_limit={feed_limit})"
     )
+
+
+# ---------------------------------------------------------------------------
+# TC-14 (Phase 2 regression)
+# ---------------------------------------------------------------------------
+
+def test_tc14_historical_sources_not_graded(settings: Settings, store: sqlite3.Connection,
+                                            config: Dict[str, Any]):
+    """TC-14: Historical replay sources never affect sensor health.
+
+    Regression guard for the dashboard fix that excludes `dashboard.historical_sources`
+    (currently `swat_replay`, a one-time replay of a 2015 dataset) from the freshness
+    grading. Those rows carry the *dataset's* timestamp rather than their capture time, so
+    the source reads as maximally stale by design; before the fix that alone flipped the
+    pipeline to `blind` — "Capture degraded" — even while every live source was reporting.
+
+    The case drives the exact failing condition: it makes both live sources fresh (a
+    benign honeypot read makes `honeypot` fresh; the GOOSE monitor keeps `monitor` fresh)
+    while the replayed source is still maximally stale, then asserts the pipeline is
+    `healthy`. A historical source that leaked back into the graded list would show up in
+    `pipeline.sources` and re-trigger the false degradation this guards against.
+    """
+    dashboard_section = config.get("dashboard") or {}
+    historical = [str(name).strip() for name in (dashboard_section.get("historical_sources") or [])]
+    assert historical, (
+        "dashboard.historical_sources is empty, so this regression cannot be exercised. "
+        "It must list the bounded replay source(s) — e.g. [swat_replay] — whose rows "
+        "carry historical timestamps and are therefore never freshness-graded."
+    )
+
+    # Make every live source fresh, deterministically.
+    mark = snapshot(store)
+    reply = lab_traffic.classic_read(
+        settings.honeypot_host, settings.honeypot_port, address=0, quantity=10
+    )
+    print(f"[TC-14] benign honeypot read -> {lab_traffic.describe_reply(reply)}")
+    assert reply is not None, (
+        "the decoy did not answer the benign read, so `honeypot` cannot be made fresh "
+        "and this regression cannot be exercised. Check `docker compose logs honeypot`."
+    )
+    honeypot_rows = wait_for(
+        store, "the honeypot side to store the interaction",
+        lambda: raw_events_after(store, mark.raw_events_id, source="honeypot"),
+        settings.event_timeout_seconds,
+    )
+    print(f"[TC-14] honeypot raw_events id {honeypot_rows[0]['id']} stored")
+    # Stamp a fresh heartbeat so a stale engine is never the reason the pipeline is not
+    # healthy — this case is about the source grading, not about detection liveness.
+    run_engine_once()
+
+    def both_live_sources_fresh() -> Optional[Dict[str, Any]]:
+        payload = dashboard_payload(settings)
+        pipeline = payload.get("pipeline") or {}
+        states = {entry["source"]: entry["state"] for entry in pipeline.get("sources") or []}
+        expected = list(pipeline.get("expected_sources") or [])
+        if expected and all(states.get(name) == "fresh" for name in expected):
+            return payload
+        return None
+
+    payload = wait_for(
+        store, "every expected source to read fresh on the dashboard",
+        both_live_sources_fresh, settings.event_timeout_seconds,
+    )
+    pipeline = payload["pipeline"]
+    graded = [entry["source"] for entry in pipeline["sources"]]
+    print(f"[TC-14] graded sources {graded}; "
+          f"pipeline state {pipeline['state']!r}")
+
+    for name in historical:
+        assert name not in graded, (
+            f"historical source {name!r} is being freshness-graded: it appears in "
+            f"pipeline.sources {graded}. A replayed source carries its dataset's timestamp "
+            "and must be excluded, or it will read as permanently stale and wrongly "
+            "degrade the pipeline."
+        )
+
+    reported = {entry["source"]: entry for entry in pipeline.get("historical") or []}
+    for name in historical:
+        assert name in reported, (
+            f"historical source {name!r} is neither graded nor reported — it should appear "
+            "in pipeline.historical so the event totals still add up"
+        )
+        entry = reported[name]
+        assert "state" not in entry, (
+            f"historical source {name!r} carries a freshness state {entry.get('state')!r}; "
+            "freshness does not apply to a replayed source and must not be reported for it"
+        )
+
+    assert pipeline["state"] == "healthy", (
+        f"pipeline reads {pipeline['state']!r} while every live source is fresh — the only "
+        f"stale source present is the replayed {historical}, which must never degrade "
+        f"health. Summary: {pipeline['summary']}"
+    )
+    for name in historical:
+        assert name not in pipeline["summary"], (
+            f"the pipeline summary names the replayed source {name!r}, so it is still being "
+            f"counted as a fault: {pipeline['summary']}"
+        )
+    print(f"[TC-14] PASS: replayed {historical} is stale but never graded; "
+          f"pipeline healthy")
