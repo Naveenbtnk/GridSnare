@@ -158,7 +158,11 @@ services:
 
     volumes:
       # Shared SQLite data store + config-driven thresholds (SPEC 7.4, Section 8).
-      - ./data:/app/data
+      # The store itself is a named volume, not ./data — see the `data` declaration at
+      # the bottom of this file for the cross-container locking failures that forced
+      # the move. The container path is unchanged (/app/data), which is why config.yaml
+      # needed no edit.
+      - data:/app/data
       - ./config.yaml:/app/config.yaml:ro
 
   # ---------------------------------------------------------------------------
@@ -203,8 +207,9 @@ services:
       - NET_ADMIN
 
     volumes:
-      # The same store, so the baseline's exchanges land beside the decoy's.
-      - ./data:/app/data
+      # The same store, so the baseline's exchanges land beside the decoy's — the named
+      # volume `data` (see the bottom of this file), not the ./data bind mount.
+      - data:/app/data
       - ./config.yaml:/app/config.yaml:ro
 
   # ---------------------------------------------------------------------------
@@ -242,7 +247,9 @@ services:
     network_mode: "none"
 
     volumes:
-      - ./data:/app/data
+      # The shared store on the named volume `data` (see the bottom of this file). This
+      # is the component that hit `database is locked` most often, once per poll cycle.
+      - data:/app/data
       - ./config.yaml:/app/config.yaml:ro
 
     # Liveness only, and labelled as such: this asserts the poll loop process is
@@ -284,7 +291,18 @@ services:
       # to alter the evidence it is transcribing.
       - conpot_logs:/var/log/conpot:ro
       # The shared store, read-write — recording honeypot events is its whole job.
-      - ./data:/app/data
+      #
+      # The named volume `data` rather than the ./data bind mount (see the bottom of
+      # this file), because this service writes one more thing beside the store: its
+      # `honeypot_ingest.offset` read cursor, which config.yaml keeps at
+      # /app/data/honeypot_ingest.offset. Both move together.
+      #
+      # Consequence of the move: the cursor starts out empty on the new volume. This
+      # ingester handles that deliberately — a missing offset means "first run", so it
+      # starts at the *end* of the decoy's log instead of replaying all of it
+      # (log_ingest.py). Without that, every interaction Conpot has ever logged would be
+      # re-ingested as a fresh honeypot event.
+      - data:/app/data
       - ./config.yaml:/app/config.yaml:ro
 
     # Liveness only, and labelled as such: this asserts the ingester is running, not
@@ -320,7 +338,9 @@ services:
     # No depends_on: the dashboard reads the store through this volume, so it
     # starts happily on a cold stack and reports an empty state instead of failing.
     volumes:
-      - ./data:/app/data
+      # The same named volume `data` every other component writes (see the bottom of this
+      # file), so the panel reports the live store rather than a copy of it.
+      - data:/app/data
       - ./config.yaml:/app/config.yaml:ro
 
     # Deliberately NOT on scada_net — see the ui_net note below.
@@ -455,8 +475,9 @@ services:
 
     volumes:
       # The shared store, read-write: recording GOOSE events is this component's whole
-      # job — unlike the decoy, whose only output is on the wire.
-      - ./data:/app/data
+      # job — unlike the decoy, whose only output is on the wire. The named volume
+      # `data` (see the bottom of this file), not the ./data bind mount.
+      - data:/app/data
       - ./config.yaml:/app/config.yaml:ro
 
     # Liveness only, and labelled as such: this asserts the process is alive, not that
@@ -609,11 +630,85 @@ services:
     volumes:
       # The shared store. Mounted read-write because the suite advances the engine
       # by one poll cycle, and the engine writes its watermark and any alerts —
-      # exactly as it does when the background loop runs.
-      - ./data:/app/data
+      # exactly as it does when the background loop runs. It is the same named volume
+      # `data` the services write (see the bottom of this file), so a case asserts on
+      # rows the running stack produced rather than on a private copy.
+      - data:/app/data
       - ./config.yaml:/app/config.yaml:ro
 
+  # ---------------------------------------------------------------------------
+  # GR-5 runner — SWaT autoencoder training / evaluation / replay (SPEC.md 20.3)
+  #
+  # Not a service: an offline batch job that trains the reconstruction-error model,
+  # scores the SWaT attack capture and replays a bounded sample of its flagged rows
+  # into the store. Behind the `gr5` profile, so `docker compose up` never starts it:
+  #
+  #   docker compose --profile gr5 run --rm gr5
+  #   docker compose --profile gr5 run --rm gr5 python scripts/train_autoencoder.py --no-store
+  #
+  # Why it is a container at all, rather than a host command: it writes to the shared
+  # store while the stack holds that database open, which is exactly the arrangement
+  # that produced the `database is locked` incidents when the store lived on the host
+  # bind mount (see the `data` volume below). In here it is a writer on the same Linux
+  # filesystem as every other service, which is what SQLite expects.
+  # ---------------------------------------------------------------------------
+  gr5:
+    build:
+      context: .
+      dockerfile: gr5/Dockerfile
+    image: gridsnare-gr5
+    profiles: ["gr5"]
+
+    # No network: its inputs are the mounted dataset and model, and its only output is
+    # the store. It makes no requests (SPEC.md Section 11: no internet exposure), and
+    # the CPU-wheel torch install happens at *build* time, not here.
+    network_mode: "none"
+
+    volumes:
+      # The store, on the same named volume the running services use, so the replayed
+      # rows land in the store the engine and dashboard actually read.
+      - data:/app/data
+      # The SWaT captures stay on the host bind mount. They are ~400 MB of read-only
+      # dataset rather than database state, so they are mounted read-only over the
+      # volume's empty /app/data/swat: nothing in a training run should be able to
+      # modify the captures it is measured against.
+      - ./data/swat:/app/data/swat:ro
+      # The trained model stays on the host too, so a rebuilt volume does not silently
+      # lose it (a fresh named volume would). Read-write: the run overwrites it.
+      #
+      # This file is gitignored, so a fresh clone does not have it. If it is missing,
+      # Docker creates a directory at this path instead of a file and the save fails —
+      # the gr5 image's entrypoint detects that case and says so (see gr5/Dockerfile),
+      # rather than letting it surface as IsADirectoryError after the training run.
+      - ./data/autoencoder.pt:/app/data/autoencoder.pt
+
 volumes:
+  # The operational store — raw_events, alerts, engine_state — plus the honeypot log
+  # ingester's read cursor.
+  #
+  # This is a named volume rather than the ./data bind mount, and the difference is not
+  # cosmetic. On a bind mount the host filesystem (here, a Windows drive through the
+  # Docker Desktop VM's 9p/virtiofs share) is the shared medium for a SQLite database
+  # that five containers open read-write, and it does not provide the locks SQLite
+  # relies on: a write from one container and a commit from another can interleave and
+  # produce `sqlite3.OperationalError: database is locked` — measured repeatedly in this
+  # lab, until one incident left the file unwritable for every container while the host
+  # could still open it. Because the store was also created with
+  # `PRAGMA journal_mode=DELETE` (store.py cannot use WAL or mmap a rollback journal's
+  # `-shm` file across that share), each commit rewrote the database in place, which
+  # widened the window further. A named volume is a real Linux filesystem inside the VM,
+  # so POSIX locking and mmap work, and the failures stop.
+  #
+  # Measured after the move: the full suite TC-1..TC-14 and a normal stack run produce
+  # zero `database is locked` errors in any service's log, against dozens of them over
+  # the same work on the bind mount.
+  #
+  # What stays on ./data: the SWaT captures (data/swat/) and the trained model
+  # (data/autoencoder.pt). They are large, read-mostly, host-owned build inputs rather
+  # than database state, so they remain bind mounts — the gr5 service at the bottom of
+  # this file is the only thing that still reads them, and it mounts them explicitly.
+  data:
+
   # Conpot's own log, shared between the decoy that writes it and the ingester that
   # transcribes it (SPEC.md Section 9 step 2). A named volume rather than a path in the
   # image, because the log is runtime evidence rather than image content.

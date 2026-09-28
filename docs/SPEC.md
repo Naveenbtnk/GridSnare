@@ -313,8 +313,25 @@ summarized in [§21](#21-📊-current-status-against-success-criteria) below.*
 
 ## 17. ⚠️ Limitations & Future Work
 
-- Rule-based detection only — no statistical or ML-based anomaly detection in v1
-- Tested against Modbus TCP primarily; DNP3 support is a stretch goal
+- Rule-based detection is the primary detector. GR-5 adds one statistical model (Section 20.3),
+  but it is an offline SWaT-replay evaluation rather than a live detector, and the rules remain
+  what the running stack decides with
+- Tested against Modbus TCP and GOOSE; DNP3 support is a stretch goal
+- **GR-1 is sequence-only, so it cannot tell a legitimate publisher restart from a replay.** A
+  restarted publisher's StNum begins again at 1, which is the same pattern a replayed frame
+  produces; measured in this lab, restarting the legitimate publisher raised a `GR-1 High`
+  against the previous StNum of 4495. Distinguishing the two needs state the frame does not
+  carry (a boot time, or a `timeAllowedToLive` cross-check) — suppressing backward StNums instead
+  would blind the rule to an actual replay
+- **GR-3's `timing_max_frames_per_window: 120` per 5 s is calibrated to this lab's capture path
+  and publisher profile, not to a standard.** It is a rate check, not an implementation of IEC
+  61850's retransmission curve, and a different publisher or capture path would need its own
+  calibration
+- **Store locking under concurrent writers, resolved by moving the store off the host bind
+  mount.** Five containers opened one SQLite database read-write on the `./data` bind mount (the
+  Docker Desktop filesystem share) and hit repeated `database is locked`; it now lives on the
+  Docker named volume `gridsnare_data` at the unchanged container path `/app/data`, with
+  `data/swat/` and `data/autoencoder.pt` still bind-mounted. See `README.md`'s Known limitations
 - Single-host dashboard with no authentication — acceptable for a local demo, not
   production-ready
 - Possible future extension: reimplement the packet parser in C/C++ for a lower-level
@@ -356,14 +373,25 @@ GridSnare/
 ├── dashboard/
 │   ├── app.py
 │   └── templates/
-├── data/
-│   └── events.db
+├── gr5/
+│   └── Dockerfile              # GR-5 runner: CPU PyTorch, offline (Compose profile `gr5`)
+├── scripts/
+│   └── train_autoencoder.py    # GR-5 train / evaluate / replay
+├── data/                       # host-mounted inputs only (see docker-compose.yml)
+│   ├── swat/                   #   SWaT captures (~400 MB, not committed)
+│   ├── autoencoder.pt          #   trained model artefact (gitignored)
+│   └── (events.db)             #   the live store is a Docker volume, not this path
 ├── tests/
 │   └── test_scenarios.py
 ├── config.yaml
 ├── README.md
 └── requirements.txt
 ```
+
+All container paths under `/app/data` are unchanged — `docker-compose.yml` decides which host
+storage backs them. The operational store (`events.db`, `honeypot_ingest.offset`) lives on the
+named volume `gridsnare_data`; the SWaT captures and the trained model stay on the `./data` bind
+mount.
 
 ---
 
@@ -417,7 +445,7 @@ infrastructure. Section 4's Rules of Engagement apply unchanged.
 |---|---|---|
 | Docker Desktop | Yes | Runs libiec61850 build + all services; avoids native Windows compilation entirely |
 | Python 3.x | Yes | Monitor, engine, dashboard |
-| PyTorch | Yes | Only needed for optional GR-5 autoencoder |
+| PyTorch | Not on the host | Needed only for the optional GR-5 autoencoder, which runs inside the `gr5` image (`gr5/Dockerfile`) exactly like every other component |
 | VS Code | Yes | Editing/reviewing, not required by the build itself |
 | Wireshark | Recommended, not required | Useful for manually inspecting GOOSE frames during development; skip if relying on Docker-internal capture only |
 
@@ -438,6 +466,15 @@ actual automated test in `tests/test_scenarios.py`, not just documented here.
 | TC-11: Timing anomaly | Transmit GOOSE frames at an interval inconsistent with the configured retransmission profile | GR-3 fires, Medium alert |
 | TC-12 (stretch, only if GR-5 is built) | Feed the autoencoder a feature vector outside the trained distribution | GR-5 fires, Medium alert |
 | TC-13: Unified dashboard check | Trigger one Modbus alert (TC-1 to TC-6) and one GOOSE alert together | Dashboard correctly shows both, tagged with the right `protocol` value, no cross-contamination |
+
+All of the above except TC-12 are implemented as automated cases in
+`tests/test_scenarios.py`, with their measured per-run results in [`README.md`](../README.md) and
+summarized in [§21](#21-📊-current-status-against-success-criteria). TC-14 was added to the plan
+during Phase 2 as a regression guard: the dashboard must never freshness-grade a replayed source
+(`dashboard.historical_sources`), because those rows carry their dataset's timestamp by design.
+
+TC-12 remains **documented but not automated**: GR-5 is built and its behaviour is measured by
+the replay run (`docker compose --profile gr5 run --rm gr5`), not asserted by the suite.
 
 Phase 2 success criteria mirror Section 13: all applicable test cases above pass
 consistently across 3+ runs before Phase 2 is considered done.
@@ -464,9 +501,21 @@ recorded in `README.md` — evidence, not restated intent, per the Content Integ
 | Runs end-to-end without manual database edits | Qualitative | **Met** — detection engine runs as a persistent compose service; clean-room teardown/rebuild verified zero manual steps |
 | README allows third-party reproduction from scratch | Qualitative | **Met** — Quick Start and clean-room reproduction steps are documented and were the actual steps measured |
 
-**Phase 2 (Section 20.6)** remains in progress: GR-1 through GR-4 and TC-7–TC-11/TC-13 are
-not yet implemented. Current gaps, each bounded by direct measurement rather than assumption,
-are tracked in `README.md`'s Known Limitations section.
+**Phase 2 (Section 20.6)** is complete apart from the TC-12 stretch case:
+
+| Section 20.6 item | Target | Measured outcome |
+|---|---|---|
+| GR-1 … GR-4 implemented, config-driven | 4 rules in the same engine and `alerts` table as DR-1…DR-7, tagged by `protocol` | **Met** — all four fire on real injected frames; TC-7…TC-11 assert each one end to end |
+| TC-7 … TC-11, TC-13 pass consistently | ≥ 3 consecutive full runs | **Met for the Phase 2 cases** — three consecutive runs of TC-7…TC-13 (6 passed each; 60.1 / 59.9 / 58.0 s), and the current tree runs the whole 13-case suite at 12 passed + TC-2 skipped by design in 50.0 s, with TC-2 verified in-window separately (605.6 s) |
+| Unified dashboard across both protocols | Qualitative | **Met** — TC-13 checks the alert row, the event it points at, and the dashboard feed agree, with no cross-contamination in either direction |
+| Replayed sources never graded for freshness | Qualitative | **Met** — TC-14: pipeline reads `healthy` while `swat_replay` reports 100 replayed rows last seen 3927 d ago |
+| GR-5 (Section 20.3, stretch) | Trained, evaluated, reported | **Met** — 78.74% detection at 5.07% FPR on the SWaT captures, run inside `gr5` |
+| TC-12 (stretch) | Automated case feeding GR-5 an out-of-distribution vector | **Not met** — no automated case; GR-5's grading is reported by the replay run instead |
+
+Current gaps, each bounded by direct measurement rather than assumption, are tracked in
+`README.md`'s Known limitations section: GR-1's inability to separate a publisher restart from a
+replay, GR-3's lab-specific threshold, and the store-locking history that the named-volume move
+resolved.
 
 ---
 

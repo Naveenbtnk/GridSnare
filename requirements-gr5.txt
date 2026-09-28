@@ -1,10 +1,22 @@
 # GridSnare — GR-5 autoencoder requirements (SPEC.md 20.3, optional stretch goal)
 #
-# Kept separate from requirements.txt so the test image does not pull in PyTorch:
-# only scripts/train_autoencoder.py and engine/autoencoder.py need these, and they
-# are run explicitly rather than as part of the lab stack.
+# Installed into the `gr5` image (gr5/Dockerfile), not on the host. README instruction 3
+# says every dependency lives in a service's Dockerfile, and this runner is no exception:
+# it writes replayed rows into the shared store while the stack holds that database open,
+# so it runs as a container on the same filesystem as every other writer rather than
+# across the Docker Desktop share (see the `data` volume in docker-compose.yml).
 #
-#   pip install -r requirements-gr5.txt
-#   python scripts/train_autoencoder.py
+#   docker compose --profile gr5 run --rm gr5
+#   docker compose --profile gr5 run --rm gr5 python scripts/train_autoencoder.py --no-store
+#
+# Kept separate from requirements.txt so the test image does not pull in PyTorch.
+#
+#   numpy   - feature matrices, imputation medians, the split permutation
+#   torch   - the autoencoder itself (CPU wheels; see gr5/Dockerfile)
+#   PyYAML  - not used by the model. `persist_flagged` imports the `alerts` schema from
+#             engine.correlator so a replay cannot write a shape the live engine cannot
+#             read, and that module loads config.yaml through yaml. Without this the run
+#             trains and evaluates correctly and then fails on its last step.
 numpy>=1.24
 torch>=2.0
+PyYAML>=6.0
