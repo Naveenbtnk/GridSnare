@@ -79,6 +79,22 @@ SUMMARY_INTERVAL_SECONDS = 30.0
 # A GOOSE frame is multicast, so a socket that is not a member of the group never
 # sees one. open_capture_socket joins with PACKET_MR_PROMISC for exactly this reason.
 # The cap the service actually needs is therefore NET_RAW.
+
+# Captured frames are committed in small batches rather than one commit per frame.
+# SQLite takes an exclusive lock for the duration of every commit, and a GOOSE flood is
+# hundreds of frames a second — so committing per frame held the store's write lock almost
+# continuously and starved the other writer on it, the detection engine, which reported
+# "database is locked" for both its alert insert and its watermark update (measured: an
+# engine pass sat on one watermark update for over a minute while a flood was in flight,
+# and its heartbeat went stale enough for the dashboard to call detection stopped).
+# Batching cuts the lock churn by the batch size while keeping a captured frame visible to
+# readers within FLUSH_INTERVAL_SECONDS: the main loop flushes once a second even when the
+# segment has gone quiet, so a quiet spell cannot leave a frame uncommitted.
+#
+# Both bounds are needed. The count keeps a busy segment's commits from growing into a
+# long-held transaction, and the interval bounds how long the newest frame stays unseen.
+FLUSH_INTERVAL_SECONDS = 0.5
+FLUSH_MAX_FRAMES = 25
 INSERT_EVENT = """
 INSERT INTO raw_events (
     timestamp, source, protocol,
@@ -210,6 +226,9 @@ class GooseMonitor:
         self.stored = 0
         self.ignored = 0          # frames on the wire that were not GOOSE
         self.undecodable = 0      # GOOSE frames this decoder could not read
+        # Frames written but not yet committed (see FLUSH_INTERVAL_SECONDS above).
+        self._pending = 0
+        self._last_flush = time.monotonic()
         # Publishers seen, keyed by source MAC — the first thing an operator wants
         # when asking "who is talking on this segment?"
         self.publishers: Dict[str, int] = {}
@@ -240,11 +259,31 @@ class GooseMonitor:
                     event["time_allowed_to_live_ms"], event["vlan_id"], event["vlan_priority"],
                 ),
             )
-            self._db.commit()
+            self._pending += 1
+            if (self._pending >= FLUSH_MAX_FRAMES
+                    or time.monotonic() - self._last_flush >= FLUSH_INTERVAL_SECONDS):
+                self._flush_locked()
         self.stored += 1
         src_mac = event["src_mac"] or "unknown"
         self.publishers[src_mac] = self.publishers.get(src_mac, 0) + 1
         self._log.info("captured %s", summarise(event))
+
+    def _flush_locked(self) -> None:
+        """Commit whatever has been written. Caller holds the lock."""
+        if self._pending:
+            self._db.commit()
+            self._pending = 0
+        self._last_flush = time.monotonic()
+
+    def flush(self) -> None:
+        """Commit any frames still buffered.
+
+        Called once per receive-loop iteration — including the iterations that time out —
+        so the newest captured frame is on disk within about a second whether or not more
+        traffic follows it.
+        """
+        with self._db_lock:
+            self._flush_locked()
 
 
 def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
@@ -352,10 +391,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     LOG.exception("failed to store a GOOSE frame; capture continues")
 
             now = time.monotonic()
+            monitor.flush()
             if now >= next_summary:
                 _log_summary(monitor, LOG)
                 next_summary = now + SUMMARY_INTERVAL_SECONDS
     finally:
+        monitor.flush()
         capture.close()
         connection.close()
 

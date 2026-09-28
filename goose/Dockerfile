@@ -8,11 +8,12 @@
 # installed on the host", and README instruction 3 says the same. This image is
 # therefore the only place the library exists.
 #
-# One image, two Phase 2 services (docker-compose.yml): the `goose` service runs the
-# decoy IED, and `goose-monitor` runs the GOOSE traffic monitor (SPEC.md 20.2). The
-# monitor does not need libiec61850 — it decodes raw frames with goose/goose_frame.py
-# — but it writes the same store, so sharing this image avoids a third build with its
-# own pinned dependency set for no gain.
+# One image, three Phase 2 services (docker-compose.yml): `goose` runs the decoy IED
+# (SPEC.md 20.2), `goose-monitor` runs the GOOSE traffic monitor (20.2), and
+# `goose-publisher` runs the legitimate baseline publisher Section 11 requires. Only
+# the two publishers need libiec61850 — the monitor decodes raw frames with
+# goose/goose_frame.py — but they share the store's schema and one pinned dependency
+# set, so one image beats three builds.
 #
 # Two stages, because the build needs a toolchain the running decoy should not
 # carry: a real protection relay on a substation LAN would not ship gcc + cmake,
@@ -112,6 +113,7 @@ RUN ldconfig \
 COPY goose/decoy_ied.py /app/goose/decoy_ied.py
 COPY goose/goose_frame.py /app/goose/goose_frame.py
 COPY goose/goose_monitor.py /app/goose/goose_monitor.py
+COPY goose/legit_publisher.py /app/goose/legit_publisher.py
 COPY goose/__init__.py /app/goose/__init__.py
 
 # The raw_events schema, shared with the Phase 1 Modbus monitor because both write the

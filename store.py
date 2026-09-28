@@ -125,6 +125,15 @@ CREATE INDEX IF NOT EXISTS idx_raw_events_src_mac_timestamp
     ON raw_events(src_mac, timestamp);
 CREATE INDEX IF NOT EXISTS idx_raw_events_gocb_timestamp
     ON raw_events(gocb_ref, timestamp);
+-- GR-1 and GR-3 read one publisher's *most recent* prior frame on every GOOSE
+-- event: `WHERE src_mac=? AND gocb_ref=? AND id<? ORDER BY id DESC LIMIT 1`.
+-- Without this index SQLite satisfies it by scanning every row for that control
+-- block and sorting them (measured: `USE TEMP B-TREE FOR ORDER BY`), which is O(N)
+-- per frame and O(N^2) over a session — enough to stall the poll loop behind the
+-- GOOSE monitor's continuous stream. With (src_mac, gocb_ref, id) it is a single
+-- seek to the newest row below the current id.
+CREATE INDEX IF NOT EXISTS idx_raw_events_publisher_id
+    ON raw_events(src_mac, gocb_ref, id);
 """
 
 # Added by Phase 2, in declaration order. Listed separately so a migration can report

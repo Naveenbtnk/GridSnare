@@ -21,6 +21,14 @@ COPY config.yaml /app/config.yaml
 COPY engine/ /app/engine/
 COPY tests/ /app/tests/
 
+# The GOOSE wire format, shared with the decoy, the legitimate publisher and the GOOSE
+# monitor. The Phase 2 cases (SPEC.md 20.6) forge, replay and flood raw frames with the
+# same codec the monitor decodes them with, so a case cannot pass by agreeing with a
+# second implementation of the format. goose_frame.py is stdlib-only, so this image does
+# not grow libiec61850 to reach it.
+COPY goose/__init__.py /app/goose/__init__.py
+COPY goose/goose_frame.py /app/goose/goose_frame.py
+
 # The shared SQLite store is mounted at /app/data by docker-compose.yml, which is
 # the path config.yaml already points every component at.
 CMD ["python", "-m", "pytest", "tests", "-v"]

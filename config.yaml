@@ -114,6 +114,39 @@ tests:
   # failing with the store's state attached.
   event_timeout_seconds: 20
 
+  # --- Phase 2 (SPEC.md 20.6, TC-7 .. TC-13) ----------------------------------
+  # The GOOSE cases inject raw Ethernet frames from this runner and assert on what the
+  # GOOSE traffic monitor saw and the engine concluded, so they need the interface to
+  # inject on. docker-compose.yml grants this service NET_RAW for exactly that.
+  #
+  # 'auto' resolves the interface from client_source_ip above, and that is what the lab
+  # needs: this runner sits on two networks and Compose does not promise which one gets
+  # eth0 — measured here, eth0 is the *dashboard* network (172.21.0.x) and eth1 is the
+  # monitored segment (172.20.0.x), and the order has varied between runs. Picking the
+  # wrong one still succeeds at the socket level, so a name-based choice would make the
+  # GOOSE cases pass or fail by luck. Name an interface explicitly only for a
+  # single-network deployment.
+  goose_interface: auto
+
+  # TC-8's "defined period" of baseline traffic (SPEC.md 20.6). Deliberately longer
+  # than goose_publisher.state_change_cycle_seconds: a window that never spanned a
+  # retransmission burst would leave the profile GR-3 is tuned against untested.
+  goose_baseline_seconds: 25
+
+  # Frames sent for TC-11's timing anomaly. GR-3 fires above
+  # engine.goose.timing_max_frames_per_window (120) frames in a 5s window, while the
+  # GOOSE monitor stores at roughly 50 frames/s (one commit per frame) and the socket
+  # drops whatever it cannot keep up with, so this has to overshoot the threshold by
+  # enough to survive those drops. Measured on this lab: 500 frames sent at full rate put
+  # 213 in the store, all 213 of them inside one 5s window.
+  goose_flood_frames: 500
+
+  # How long to let the engine work through the frames a case generated. The engine
+  # judges GOOSE rows at roughly 22ms each on this bind-mounted store (measured: 300
+  # rows in 6.7s), so a flood's backlog is seconds of work, not minutes — but it is not
+  # instant, and a case that asserted before the backlog was drained would be racing it.
+  goose_drain_timeout_seconds: 180
+
 # --- Alert dashboard (SPEC.md Section 7.5) ----------------------------------
 # Views: live alert feed, severity breakdown chart, timeline and the honeypot vs.
 # monitor event split. Reads the same store the monitor and engine write.
@@ -228,6 +261,76 @@ goose:
   # anything that arrives for it did not come from a legitimate relay.
   subscribed_gocb_ref: GS_DECOY_PEER/PROT/LLN0$GO$gcbPeerTrip
 
+# --- Legitimate GOOSE publisher (SPEC.md Section 11) -----------------------
+# Section 11 makes a legitimate (non-decoy) publisher a required lab component, for
+# exactly the reason it makes the Modbus PLC simulator above one: the decoy IED has no
+# legitimate traffic by design, so a "GOOSE baseline produces no alert" test aimed at
+# the decoy would only be asserting that the decoy's own correct GR-4 finding is
+# absent. SPEC.md 20.6 TC-8 needs a real publisher to watch instead.
+#
+# This is a real relay's publishing half: one control block, published on the
+# IEC 61850-8-1 pattern (a decaying burst after a state change, then a steady
+# heartbeat), with StNum advanced on each state change and SqNum incremented within a
+# state — the sequence GR-1 validates. Nothing about it is bait: no forged identity, no
+# replayed frames, no off-profile timing. That is what makes "GR-1 through GR-4 never
+# flag it" a meaningful assertion rather than a tautology.
+#
+# It writes nothing to the shared store and no rule knows it exists — like the PLC, it
+# is an asset, not part of the detection path. Its link address is pinned in
+# docker-compose.yml and repeated here as src_mac so the two cannot drift apart
+# silently: GR-2's allow-list (engine.goose.known_publishers) is keyed on that MAC, so
+# the publisher compares it against its own interface MAC at startup and refuses to run
+# if they differ.
+#
+# Not in dashboard.expected_sources, for the same reason the decoy is not: it publishes
+# onto the wire and nothing into the store, so there is no event stream for the sensor
+# health panel to grade.
+goose_publisher:
+  # Its own link, like the decoy's and for the same reason: it injects raw Ethernet
+  # frames, and a container sharing another's network namespace cannot be given its own
+  # MAC address.
+  interface: eth0
+  log_level: INFO
+
+  # --- published control block ------------------------------------------------
+  # A different IED name, GoCB and APPID from the decoy's (see the `goose:` section),
+  # on a different GOOSE multicast group, so a subscriber — and GR-2's allow-list — can
+  # tell the two devices apart on the wire rather than by which container they came from.
+  goid: GSBASE/PROT$gcbProtTrip
+  gocb_ref: GSBASE/PROT/LLN0$GO$gcbProtTrip
+  dataset_ref: GSBASE/PROT/LLN0$dsProtTrip
+  conf_rev: 1
+
+  # This container's eth0 address, pinned in docker-compose.yml. GR-2 identifies a
+  # publisher by (control block, source MAC), so this is an identity the publisher
+  # verifies at startup, not a label it carries.
+  src_mac: "02:00:5e:00:53:02"
+
+  # 0x3002 — inside the GOOSE APPID range 0x0000-0x3FFF, and one above the decoy's
+  # 0x3001 so the two blocks are never confusable.
+  app_id: 12290
+  dst_mac: "01:0c:cd:01:00:02"
+  vlan_id: 0
+  vlan_priority: 4
+
+  # --- timing profile ---------------------------------------------------------
+  # The same IEC 61850-8-1 shape as the decoy's, because that is the profile the
+  # standard defines and the one GR-3 measures against: a fast burst decaying to a
+  # steady heartbeat. A baseline that never burst would leave the very shape GR-3 is
+  # tuned against untested, which is why the state change below is on a cycle rather
+  # than never happening.
+  retransmission_profile_ms: [10, 20, 40, 80, 160, 320, 640, 1000]
+  heartbeat_seconds: 2.0
+  time_allowed_to_live_ms: 4000
+
+  # --- the process value this publisher reports -------------------------------
+  # A breaker position that toggles on a schedule: an ordinary substation event, so
+  # StNum advances and the burst profile is exercised on the wire in plain sight. The
+  # cycle is deliberately not the decoy's 30s/4s protection trip, so the two devices are
+  # not in lockstep and a reader cannot mistake one device's burst for the other's.
+  state_change_cycle_seconds: 20.0
+  state_hold_seconds: 3.0
+
 # --- GOOSE traffic monitor (SPEC.md Section 20.2) ---------------------------
 # The observer half of Phase 2: it captures every GOOSE frame on the lab segment and
 # records it in the shared store with protocol='goose'. Deliberately separate from the
@@ -323,3 +426,71 @@ engine:
     # host for a 300s window hid a second, separate honeypot hit from a host already
     # correlated — see engine/correlator.py.
     alert_cooldown_seconds: 300
+
+  # --- GOOSE detection rules GR-1..GR-4 (SPEC.md Section 20.3) ----------------
+  # These run in this same engine against the rows the GOOSE traffic monitor wrote
+  # (protocol='goose', see goose/goose_monitor.py). They live under their own section
+  # because their vocabulary is GOOSE — control-block references and source MACs, not
+  # IPs and function codes.
+  #
+  # IMPORTANT: the decoy identity below is what the rules treat as known. SPEC.md 20.3
+  # GR-2/GR-4 key on it, so if the decoy's published identity in the `goose:` section
+  # above changes, these must change with it — the decoy's `goose:` docstring says the
+  # same thing from the other side.
+  goose:
+    # The decoy IED's own published control block and link address. The decoy's own
+    # frames are the *legitimate reference* this segment is judged against, so:
+    #   * GR-4 fires on any frame referencing this GoCB from a source other than
+    #     decoy_src_mac (the decoy's own publication is not an intrusion);
+    #   * GR-2 does not judge this GoCB at all — GR-4 owns it — so a foreign MAC
+    #     claiming it yields one Critical GR-4, not a duplicate GR-2.
+    # Both values mirror the `goose:` section and docker-compose.yml's pinned MAC.
+    decoy_gocb_ref: GSDECOY/PROT/LLN0$GO$gcbProtTrip
+    decoy_src_mac: "02:00:5e:00:53:01"
+
+    # GR-2 known-publisher allow-list: GoCB reference -> the source MACs permitted to
+    # publish it. Any other (GoCB, MAC) pair is Critical GR-2 — a MAC that does not
+    # match the allow-list for a control block is spoofing. A GoCB absent from this
+    # map has no known publisher at all and is likewise flagged.
+    #
+    #   * the decoy's own block is listed so its legitimate frames pass GR-2 (GR-4
+    #     still governs impostors on it);
+    #   * GSBASE/... is the legitimate baseline publisher (the `goose_publisher:`
+    #     section below) that SPEC.md Section 20.6 TC-8 requires: a publisher distinct
+    #     from the decoy. Listing it is what makes "baseline traffic produces no alert"
+    #     a real assertion rather than an accident.
+    known_publishers:
+      GSDECOY/PROT/LLN0$GO$gcbProtTrip: ["02:00:5e:00:53:01"]
+      GSBASE/PROT/LLN0$GO$gcbProtTrip: ["02:00:5e:00:53:02"]
+
+    # GR-3 retransmission timing. A conforming publisher retransmits on a decaying
+    # burst (see goose.retransmission_profile_ms above) then holds a heartbeat. GR-3
+    # counts how many frames one publisher emits inside a trailing window and flags a
+    # rate the profile cannot produce — i.e. a publisher transmitting far faster than
+    # any legitimate cadence.
+    #
+    # Measured, not assumed. A one-second window cannot be used here: the capture
+    # path timestamps a frame when the monitor reads it, so when the store is briefly
+    # contended a burst of buffered frames flushes with bunched timestamps, and the
+    # legitimate decoy reaches 44 frames in one second the same way a flood does. Over
+    # a five-second window the two separate cleanly: the decoy peaks at 51 frames
+    # (burst + heartbeats + that flush artifact), while an injected flood of 800 frames
+    # was recorded as 237. 120 sits well clear of the former and well below the latter.
+    timing_window_seconds: 5.0
+    timing_max_frames_per_window: 120
+
+    # GR-2 fires per offending frame; GR-3 de-duplicates itself per this window so a
+    # sustained flood produces one alert rather than one per packet. (GR-1 and GR-4 are
+    # per-event like DR-1..DR-3: every offending frame is a distinct finding.)
+    #
+    # 30s rather than the 300s the Modbus per-source rules use. GR-3's subject is a
+    # *rate*, so a short re-announce window is the right granularity for an anomaly that
+    # is still in progress: five minutes of silence after the first finding could not
+    # distinguish a flood that had stopped from one that had not, and it still bounds the
+    # volume at two alerts a minute while the flood continues.
+    #
+    # The test plan depends on the same number, which is why it is short enough to be
+    # observed repeatedly: SPEC.md 20.6 with Section 13 requires the cases to pass across
+    # three consecutive runs, and a suppression window longer than the gap between them
+    # would have each run assert a rule it had muted itself on the previous one.
+    cooldown_seconds: 30

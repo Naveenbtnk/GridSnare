@@ -29,6 +29,7 @@ import signal
 import sqlite3
 import sys
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
@@ -52,6 +53,11 @@ from engine.rules import (  # noqa: E402  (import after the sys.path bootstrap)
     evaluate_event,
     parse_event_timestamp,
     utc_now_iso,
+)
+from engine.goose_rules import (  # noqa: E402  (import after the sys.path bootstrap)
+    GooseRuleContext,
+    GooseThresholds,
+    evaluate_goose_event,
 )
 
 LOG = logging.getLogger("gridsnare.engine")
@@ -104,6 +110,69 @@ INSERT OR IGNORE INTO alerts (
 
 WATERMARK_KEY = "raw_events_watermark"
 
+# How long a write keeps trying before it gives up on a locked store. The store is one
+# SQLite file with several writers in different containers — both traffic monitors, this
+# engine's background loop, and any one-off `--once` pass — so a write can find the
+# database locked through no fault of its own. SQLite's own busy timeout covers the
+# ordinary case; this covers the case where a monitor is saturating the store (a GOOSE
+# flood, for instance) and the lock keeps being taken between attempts.
+#
+# A *time* budget rather than an attempt count, and deliberately not much larger than the
+# per-attempt wait below: each failed attempt costs a full busy timeout, so a
+# count-based retry multiplied that wait and turned a five-second contention burst into
+# minute-long poll cycles (measured: one `--once` pass sat on a single watermark update
+# for over a minute, with the heartbeat stale and the dashboard reading it as a stalled
+# engine). The budget bounds that.
+LOCK_RETRY_SECONDS = 20.0
+LOCK_RETRY_BASE_DELAY = 0.25
+LOCK_RETRY_MAX_DELAY = 2.0
+
+
+def is_locked(exc: BaseException) -> bool:
+    """Is this SQLite error the store being busy rather than the statement being wrong?"""
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
+def write_with_retry(
+    connection: sqlite3.Connection,
+    sql: str,
+    params: Sequence[Any],
+    logger: logging.Logger = LOG,
+    what: str = "write",
+) -> sqlite3.Cursor:
+    """Execute one write, retrying while SQLite reports the store as locked.
+
+    Retried rather than propagated, and that is a correctness decision rather than a
+    cosmetic one: an exception here used to end the poll loop, so the engine exited, Docker
+    restarted it, it re-read the same watermark, hit the same contention and exited again —
+    a detection *outage* caused by contention that would have cleared on its own, with the
+    dashboard's only symptom being a stale heartbeat. Every write in this module is
+    idempotent (alerts are `INSERT OR IGNORE` keyed on (rule_id, event_id); the watermark
+    only ever moves forward), so repeating one after a failure cannot double-count.
+    """
+    deadline = time.monotonic() + LOCK_RETRY_SECONDS
+    delay = LOCK_RETRY_BASE_DELAY
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            cursor = connection.execute(sql, params)
+            connection.commit()
+            return cursor
+        except sqlite3.OperationalError as exc:
+            if not is_locked(exc) or time.monotonic() >= deadline:
+                raise
+            logger.warning(
+                "%s found the store locked (attempt %d, %.0fs left to try); retrying in %.2fs",
+                what, attempt, deadline - time.monotonic(), delay,
+            )
+            # A failed statement can leave an implicit transaction open, and retrying
+            # inside it would keep the very lock that is blocking us.
+            connection.rollback()
+            time.sleep(delay)
+            delay = min(delay * 2, LOCK_RETRY_MAX_DELAY)
+
 # Heartbeat, so the dashboard can distinguish "nothing to detect" from "detection
 # stopped". Without it the only evidence the engine exists is the watermark, which
 # goes stale in lockstep with the traffic: a quiet lab and a dead engine leave the
@@ -124,6 +193,7 @@ class EngineConfig:
     poll_interval_seconds: float
     log_level: str
     thresholds: DetectionThresholds
+    goose_thresholds: GooseThresholds
 
     @classmethod
     def load(cls, path: str) -> "EngineConfig":
@@ -156,6 +226,7 @@ class EngineConfig:
             poll_interval_seconds=interval,
             log_level=str(section.get("log_level") or "INFO").upper(),
             thresholds=DetectionThresholds.from_mapping(section.get("detection")),
+            goose_thresholds=GooseThresholds.from_mapping(section.get("goose")),
         )
 
 
@@ -170,6 +241,13 @@ def open_database(path: str) -> sqlite3.Connection:
     # a second container while the monitor holds it.
     connection.execute("PRAGMA journal_mode=DELETE")
     connection.execute("PRAGMA synchronous=NORMAL")
+    # Deliberately shorter than sqlite3.connect's default 5s. The wait is spent *inside*
+    # each attempt at a locked write, so a long one turns write_with_retry's budget into a
+    # very small number of very slow attempts; a short wait and more attempts rides out a
+    # burst better and keeps a poll cycle bounded either way. It applies to this engine's
+    # reads too, which is fine: a read that cannot get in is reported and retried on the
+    # next cycle rather than holding up detection.
+    connection.execute("PRAGMA busy_timeout=2000")
     connection.executescript(SCHEMA)
     connection.commit()
     return connection
@@ -197,12 +275,14 @@ def get_watermark(connection: sqlite3.Connection) -> int:
 
 
 def set_watermark(connection: sqlite3.Connection, value: int) -> None:
-    connection.execute(
+    write_with_retry(
+        connection,
         "INSERT INTO engine_state (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (WATERMARK_KEY, str(value)),
+        LOG,
+        "watermark update",
     )
-    connection.commit()
 
 
 def read_state(connection: sqlite3.Connection, key: str) -> Optional[str]:
@@ -219,26 +299,30 @@ def read_state(connection: sqlite3.Connection, key: str) -> Optional[str]:
 def record_heartbeat(connection: sqlite3.Connection) -> str:
     """Stamp a completed poll cycle. Returns the timestamp written."""
     stamp = utc_now_iso()
-    connection.execute(
+    write_with_retry(
+        connection,
         "INSERT INTO engine_state (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (LAST_POLL_KEY, stamp),
+        LOG,
+        "heartbeat update",
     )
-    connection.commit()
     return stamp
 
 
 def insert_alert(connection: sqlite3.Connection, alert: Alert, logger: logging.Logger = LOG) -> bool:
     """Write an alert, ignoring duplicates. True when a new row was inserted."""
-    cursor = connection.execute(
+    cursor = write_with_retry(
+        connection,
         INSERT_ALERT,
         (
             utc_now_iso(), alert.rule_id, alert.severity, alert.protocol,
             alert.src_ip, alert.dst_ip, alert.description,
             alert.event_id, alert.correlated_event_id,
         ),
+        logger,
+        f"alert {alert.rule_id}",
     )
-    connection.commit()
     if cursor.rowcount == 1:
         level = logging.WARNING if alert.severity in (SEVERITY_HIGH, SEVERITY_CRITICAL) else logging.INFO
         logger.log(level, "ALERT %s [%s] %s", alert.rule_id, alert.severity, alert.description)
@@ -354,6 +438,7 @@ def correlate_honeypot_and_monitor(
 def process_new_events(
     connection: sqlite3.Connection,
     thresholds: DetectionThresholds,
+    goose_thresholds: GooseThresholds,
     logger: logging.Logger = LOG,
 ) -> Tuple[int, int]:
     """Judge every event newer than the watermark. Returns (events, alerts)."""
@@ -369,11 +454,19 @@ def process_new_events(
         return (0, 0)
 
     context = RuleContext(connection=connection, thresholds=thresholds, logger=logger)
+    goose_context = GooseRuleContext(
+        connection=connection, thresholds=goose_thresholds, logger=logger
+    )
     alerts_written = 0
 
     for row in rows:
         event = dict(row)
+        # Each evaluator gates on the event's protocol itself, so both run on every
+        # row and a Modbus event can never reach a GOOSE rule or vice versa.
         for alert in evaluate_event(event, context):
+            if insert_alert(connection, alert, logger):
+                alerts_written += 1
+        for alert in evaluate_goose_event(event, goose_context):
             if insert_alert(connection, alert, logger):
                 alerts_written += 1
         correlated = correlate_honeypot_and_monitor(event, context)
@@ -457,7 +550,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                  max(0, args.from_event_id - 1), args.from_event_id)
 
     if args.once:
-        events, alerts = process_new_events(connection, config.thresholds, LOG)
+        events, alerts = process_new_events(
+            connection, config.thresholds, config.goose_thresholds, LOG
+        )
         record_heartbeat(connection)
         LOG.info("single pass complete: %d event(s) judged, %d alert(s) written", events, alerts)
         connection.close()
@@ -475,10 +570,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     LOG.info("polling raw_events every %ss", config.poll_interval_seconds)
     try:
         while not stop.is_set():
-            events, alerts = process_new_events(connection, config.thresholds, LOG)
-            # Stamped after every cycle, including quiet ones: the heartbeat is how
-            # the dashboard tells "no traffic" from "engine not running".
-            record_heartbeat(connection)
+            try:
+                events, alerts = process_new_events(
+                    connection, config.thresholds, config.goose_thresholds, LOG
+                )
+                # Stamped after every cycle, including quiet ones: the heartbeat is how
+                # the dashboard tells "no traffic" from "engine not running".
+                record_heartbeat(connection)
+            except sqlite3.OperationalError as exc:
+                # A store that stayed locked through every retry above. Go round again
+                # instead of exiting: the loop is the whole deployment, and dying here
+                # would leave the lab with no detection until someone noticed.
+                if not is_locked(exc):
+                    raise
+                LOG.error(
+                    "poll cycle failed (%s); retrying after %ss",
+                    exc, config.poll_interval_seconds,
+                )
+                stop.wait(config.poll_interval_seconds)
+                continue
             if events:
                 LOG.info("poll: %d event(s) judged, %d alert(s) written", events, alerts)
             stop.wait(config.poll_interval_seconds)

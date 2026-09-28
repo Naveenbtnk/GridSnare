@@ -470,6 +470,72 @@ services:
       start_period: 10s
 
   # ---------------------------------------------------------------------------
+  # Legitimate GOOSE publisher — SPEC.md Section 11 (required component)
+  #
+  # The GOOSE half of the `plc` service above, and required for the same reason:
+  # Section 11 names "a legitimate GOOSE publisher distinct from the decoy IED" as what
+  # TC-8 needs, because a decoy has no legitimate traffic by design, so a "baseline
+  # produces no alert" test aimed at one would only be asserting that the decoy's own
+  # correct GR-4 finding is absent.
+  #
+  # Measured before this existed: the GOOSE baseline could only be demonstrated by
+  # forging frames from a hand-run script, so nothing in the stack published compliant
+  # GOOSE traffic and TC-8 had nothing legitimate to watch.
+  #
+  # It reuses the goose image because it publishes through the same libiec61850 build
+  # (SPEC.md 20.4: the test plan's legitimate sequences come from the library's own
+  # publisher API). It is a real relay's publishing half, not a decoy: no bait values, no
+  # subscriber, and nothing written to the shared store.
+  # ---------------------------------------------------------------------------
+  goose-publisher:
+    build:
+      context: .
+      dockerfile: goose/Dockerfile
+    image: gridsnare-goose
+    container_name: gridsnare-goose-publisher
+    restart: unless-stopped
+    command: ["python", "-u", "goose/legit_publisher.py"]
+
+    # Its own address and MAC, for the same reason the decoy has them: it injects raw
+    # Ethernet frames, and a container sharing another's namespace cannot be given its
+    # own MAC.
+    #
+    # The MAC is pinned because GR-2's known-publisher allow-list is keyed on it
+    # (engine.goose.known_publishers, SPEC.md 20.3). An auto-assigned MAC would silently
+    # change what "the legitimate publisher" means on every boot — and would make the
+    # publisher look like a spoofer to this lab's own rules. config.yaml repeats the value
+    # as goose_publisher.src_mac and the service refuses to start if the two disagree.
+    networks:
+      scada_net:
+        ipv4_address: 172.20.0.7
+        mac_address: "02:00:5e:00:53:02"
+
+    # The single capability raw Ethernet injection needs. No NET_ADMIN: unlike the decoy
+    # this service has no receive path at all, so it never needs to set IFF_PROMISC.
+    cap_add:
+      - NET_RAW
+
+    volumes:
+      # The same config the rest of the stack reads (SPEC.md Section 8). No ./data mount
+      # on purpose: capturing and storing GOOSE events is the traffic monitor's job
+      # (SPEC.md 20.2), and an asset that wrote its own event rows would be marking its
+      # own homework.
+      - ./config.yaml:/app/config.yaml:ro
+
+    # Liveness only, and labelled as such: this asserts the process is alive, NOT that
+    # frames are reaching the wire. Nothing inside this container can prove publication —
+    # that is what the GOOSE traffic monitor and SPEC.md 20.6's TC-8 are for.
+    #
+    # Reads /proc/1/cmdline rather than using pgrep, which python:3.12-slim does not
+    # contain (see the `goose` service's note, where that cost a false `unhealthy`).
+    healthcheck:
+      test: ["CMD-SHELL", "tr '\\0' ' ' < /proc/1/cmdline | grep -q legit_publisher.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
   # Test runner — SPEC.md Section 12 (Phase 1) / 20.6 (Phase 2)
   # Runs tests/test_scenarios.py inside Docker, on the lab network, so the plan
   # drives the same stack an operator would (README instruction 3: no packages on
@@ -513,13 +579,32 @@ services:
       # loop is actually alive before the first case sends traffic.
       engine:
         condition: service_healthy
+      # The Phase 2 cases (TC-7..TC-13) inject GOOSE frames and assert on what the GOOSE
+      # traffic monitor captured, so neither may start ahead of them. The publisher is
+      # TC-8's baseline source: without it running, a "no alert" result would describe an
+      # idle segment rather than a well-behaved one.
+      goose-monitor:
+        condition: service_started
+      goose-publisher:
+        condition: service_started
 
-    # scada_net to send Modbus to the decoy; ui_net only to query the dashboard API
-    # for TC-6. It makes no outbound requests (SPEC Section 11: no internet exposure).
+    # scada_net to send Modbus to the decoy and raw GOOSE frames onto the segment; ui_net
+    # only to query the dashboard API for TC-6. It makes no outbound requests (SPEC
+    # Section 11: no internet exposure).
     networks:
       scada_net:
         ipv4_address: 172.20.0.5
       ui_net: {}
+
+    # NET_RAW for the Phase 2 GOOSE cases: TC-7, TC-9, TC-10, TC-11 and TC-13 inject raw
+    # Ethernet frames to produce the anomalies SPEC.md 20.6 describes, and TC-9/TC-8 also
+    # capture frames off the segment to check what a publisher actually put on the wire.
+    #
+    # Without it those cases cannot run at all, and they say so rather than passing: a
+    # case that cannot inject has nothing to assert. No NET_ADMIN — the capture socket
+    # joins the GOOSE multicast group with PACKET_MR_PROMISC, which does not need it.
+    cap_add:
+      - NET_RAW
 
     volumes:
       # The shared store. Mounted read-write because the suite advances the engine
