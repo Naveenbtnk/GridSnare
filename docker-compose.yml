@@ -267,6 +267,16 @@ services:
       GRIDSNARE_OPERATIONAL_END: "${GRIDSNARE_OPERATIONAL_END:-}"
       GRIDSNARE_OPERATIONAL_TZ: "${GRIDSNARE_OPERATIONAL_TZ:-}"
 
+      # Container-local time, and *only* log rendering: the base image has no tzdata
+      # configured, so every log line is stamped UTC while the window DR-4 talks about
+      # is Asia/Kolkata — which makes a 21:36 IST judgement read as 16:06 and invites
+      # exactly the misreading that "03:18 outside operational hours" once was. No
+      # stored value moves: every timestamp in the stack is written from
+      # datetime.now(timezone.utc) (`utc_now_iso` in engine/rules.py, monitor and
+      # goose_monitor) and DR-4 converts the instant into the configured zone itself, so
+      # this changes nothing about what any rule decides.
+      TZ: "Asia/Kolkata"
+
     # The engine does not use the network. It reads config.yaml and the shared store,
     # writes alerts and the engine_state heartbeat, and originates nothing.
     network_mode: "none"
@@ -661,6 +671,12 @@ services:
       GRIDSNARE_OPERATIONAL_START: "${GRIDSNARE_OPERATIONAL_START:-}"
       GRIDSNARE_OPERATIONAL_END: "${GRIDSNARE_OPERATIONAL_END:-}"
       GRIDSNARE_OPERATIONAL_TZ: "${GRIDSNARE_OPERATIONAL_TZ:-}"
+
+      # Same reason as the engine above: so a run reported in IST and a window configured
+      # in IST are read against the same clock. TC-2's skip decision does not depend on
+      # it either way — it compares a tz-aware instant against the configured zone — but
+      # the timestamps pytest prints should not need translating.
+      TZ: "Asia/Kolkata"
 
     volumes:
       # The shared store. Mounted read-write because the suite advances the engine
