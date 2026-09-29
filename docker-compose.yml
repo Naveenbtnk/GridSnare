@@ -258,7 +258,10 @@ services:
     # which recreates this container with a window wide enough for the Section 12
     # plan to run at any hour (README, "Run the full plan at any hour"). Re-running
     # `docker compose up -d engine` with the variables unset restores the committed
-    # window; every override is logged as a warning at startup.
+    # window. Every startup that sees any of these set logs the window it will actually
+    # use, including when the value merely restates config.yaml (engine/rules.py,
+    # `_report_startup_window`), so a leftover variable cannot present as "DR-4 stopped
+    # firing" with nothing in the log to explain it.
     environment:
       GRIDSNARE_OPERATIONAL_START: "${GRIDSNARE_OPERATIONAL_START:-}"
       GRIDSNARE_OPERATIONAL_END: "${GRIDSNARE_OPERATIONAL_END:-}"

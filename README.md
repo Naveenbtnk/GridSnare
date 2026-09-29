@@ -31,8 +31,8 @@
 |---|---|
 | Phase 1 test suite | **6/6** cases passing across 6 independent full runs (TC-1 … TC-6) |
 | Phase 2 test suite | **7/7** cases passing on the current tree (TC-7 … TC-11, TC-13, TC-14) |
-| Full-suite run on the current tree | **13/13 passed in 656.8 s** — the complete Section 12 + 20.6 plan with no case skipped, run at an off-hours wall clock (03:18 IST) through the documented operational-hours override. TC-2 passed for real: **40/40 baseline requests observed, 0 alerts, 0 DR-4** |
-| Off-hours baseline coverage | **3 → 0** DR-4 false positives from the suite's own whitelisted baseline traffic (every DR-4 alert this lab ever raised was the baseline being judged out-of-hours at 21:36 / 22:28 / 22:33 IST) |
+| Full-suite run on the current tree | **13/13 passed in 656.8 s** — the complete Section 12 + 20.6 plan with no case skipped. TC-2 passed for real: **40/40 baseline requests observed, 0 alerts, 0 DR-4**. The run started at 08:48 IST, i.e. inside the window, so it is evidence about the suite rather than about the override |
+| Off-hours DR-4 false positives | **3 — every DR-4 alert this lab has ever raised**, all of them the suite's own whitelisted baseline judged out-of-hours at 21:36 / 22:28 / 22:33 IST (see [Run the full plan at any hour](#-run-the-full-plan-at-any-hour)) |
 | GOOSE detection rules | **GR-1 … GR-4 implemented**, config-driven, each firing on real injected frames in the lab (SPEC.md 20.3) |
 | GR-5 SWaT validation | **78.74% detection at 5.07% FPR** — 43,007 / 54,621 attack rows; 10,548 / 208,066 held-out normal rows |
 | False positives eliminated | **80 → 0** after the legitimate PLC baseline was added (Section 11) |
@@ -179,7 +179,7 @@ pie showData
 <summary>Per-case evidence (click to expand)</summary>
 
 - **TC-1** — an FC 3 read to the decoy was captured, ingested, and produced `['DR-1', 'DR-7']`.
-- **TC-2** — 40 whitelisted reads over 600 s to the real PLC (5/min, half of DR-6's limit): 40/40 observed, 0 alerts; measured at 03:18 IST under the documented override, with the store holding **0** DR-4 alerts for the run.
+- **TC-2** — 40 whitelisted reads over 600 s to the real PLC (5/min, half of DR-6's limit): 40/40 observed, 0 alerts, and **0** DR-4 rows for the run. Measured at 08:48 IST, inside the configured window; the override was exported for that run but was not what made the case pass.
 - **TC-3** — FC 43 (Read Device Identification) to the decoy produced `[('DR-2', 'High')]`.
 - **TC-4** — FC 6 write of 16962 to register 59 (range 0–9) produced DR-2, DR-3, DR-7, and DR-1.
 - **TC-5** — an out-of-range write and the resulting honeypot hit were linked by DR-7 into one Critical alert.
@@ -284,6 +284,13 @@ docker compose --profile test run --rm tests
 Watch detection live with `docker compose logs -f engine`; the dashboard's **Sensor health**
 panel reports `Detection running` while its heartbeat is fresh.
 
+> If the dashboard ever shows **DR-4 not firing when you expect it to**, check for these env
+> vars in your shell (`env | grep GRIDSNARE_OPERATIONAL_`): a `GRIDSNARE_OPERATIONAL_START` /
+> `_END` / `_TZ` left over from an off-hours test run widens — or shifts — the window DR-4
+> judges, which disables off-hours detection by design. The engine logs which window it is
+> using on every startup, so `docker compose logs engine | grep OPERATIONAL-HOURS` names the
+> cause, and `unset` plus `docker compose up -d engine` clears it.
+
 To observe Phase 2 GOOSE traffic independently from inside the lab network:
 
 ```bash
@@ -305,9 +312,10 @@ Every DR-4 alert this lab has ever raised was exactly that: the suite's own base
 DR-4 is judged by the persistent `engine` service from **its own** config load, so the override
 has to reach that container and not just the test runner — otherwise the suite stops skipping
 while the engine keeps alerting. Exporting the three `GRIDSNARE_OPERATIONAL_*` variables widens
-the window for both services, leaves the committed `config.yaml` untouched, and makes every
-process that honours it log a warning naming the value it overrode, so an off-hours run is never
-silent about what it changed. The engine's startup log is the one to read:
+the window for both services, leaves the committed `config.yaml` untouched, and makes the engine
+say which window it will actually use on **every** startup where any of them is set — including
+when the value matches `config.yaml`, so a variable that changes nothing today still announces
+itself. The engine's startup log is the one to read:
 
 ```bash
 # all 13 cases, at any hour, without editing config.yaml
@@ -320,10 +328,30 @@ The `docker compose up -d engine` is the half that matters: it recreates the eng
 widened window, which it confirms on startup.
 
 ```text
-operational_hours.start overridden by GRIDSNARE_OPERATIONAL_START='00:00' for this process —
-  the committed config.yaml still declares '06:00'. ...
+OPERATIONAL-HOURS OVERRIDE ACTIVE for this process: DR-4 will judge activity against
+00:00-23:59 Asia/Kolkata, not the configured 06:00-20:00 Asia/Kolkata
+(GRIDSNARE_OPERATIONAL_START='00:00', GRIDSNARE_OPERATIONAL_END='23:59'). DR-4 therefore will
+not fire where it normally would, and config.yaml on disk is unchanged. ...
 thresholds in effect: ... hours=00:00-23:59 Asia/Kolkata days=[0, 1, 2, 3, 4, 5, 6] ...
 ```
+
+Set them to the values `config.yaml` already declares and the line changes rather than
+disappearing — the window is unchanged, but the variables are still reported as present:
+
+```text
+OPERATIONAL-HOURS OVERRIDE PRESENT BUT INERT: GRIDSNARE_OPERATIONAL_START='06:00',
+GRIDSNARE_OPERATIONAL_END='20:00' is set, but the window it declares (06:00-20:00 Asia/Kolkata)
+is the configured one (06:00-20:00 Asia/Kolkata), so DR-4 behaves normally here. ...
+```
+
+**What is verified, and what is not.** The wiring is verified directly: the `engine` container
+carries all three names, its startup log reports `hours=00:00-23:59 Asia/Kolkata` when they are
+exported and `hours=06:00-20:00 Asia/Kolkata` when they are not, and the window TC-2 tests
+against follows the same variables — the committed window covers 06:00–20:00 IST and skips the
+other ten hours of the day, the widened one covers all 24. The end-to-end off-hours run itself
+has **not** been measured here: the command above was exercised at 08:48 IST, inside the window,
+where TC-2 runs either way, so that run says nothing about the override. The hours in which DR-4
+previously fired on this baseline (21:36–22:33 IST) are the ones to run it in.
 
 Because the variables are declared in `docker-compose.yml` for both services with an empty
 default, a plain `docker compose up -d` still uses the committed window and DR-4 can still fire

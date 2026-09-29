@@ -90,32 +90,53 @@ class OperationalHours:
     # DR-4 *by design*, so the case correctly skips rather than reporting a pass it did
     # not earn. Rather than weaken the committed window (which would make DR-4 unable
     # to fire in normal operation), the window can be declared for a single run through
-    # the environment. The committed config.yaml is untouched, and every override is
-    # logged as a warning so an off-hours run is never silent about what it changed.
+    # the environment. It also matters *where* it is declared: the engine judges DR-4 in
+    # its own process from its own config load, so an override that reaches only the
+    # test runner would leave the engine alerting on the suite's baseline traffic.
+    #
+    # The window this process will actually use is therefore announced on every startup
+    # (`_report_startup_window`), so that neither an off-hours run nor a variable left
+    # behind in a developer's shell can hide behind "DR-4 stopped firing".
     ENV_START = "GRIDSNARE_OPERATIONAL_START"
     ENV_END = "GRIDSNARE_OPERATIONAL_END"
     ENV_TZ = "GRIDSNARE_OPERATIONAL_TZ"
 
+    # YAML key -> the environment variable that may override it.
+    ENV_OVERRIDES = (
+        ("start", ENV_START),
+        ("end", ENV_END),
+        ("timezone", ENV_TZ),
+    )
+
     @classmethod
-    def _override(cls, key: str, env_name: str, section: Mapping[str, Any]) -> Any:
-        """Return the environment's value for `key`, falling back to the YAML section."""
-        raw = os.environ.get(env_name)
-        if raw is None or not raw.strip():
-            return section.get(key)
-        LOG.warning(
-            "operational_hours.%s overridden by %s=%r for this process — the committed "
-            "config.yaml still declares %r. This exists so the validation suite can run "
-            "off-hours; it must not be set for normal lab operation.",
-            key, env_name, raw, section.get(key),
+    def _override(
+        cls,
+        key: str,
+        env_name: str,
+        section: Mapping[str, Any],
+        use_environment: bool = True,
+    ) -> Any:
+        """Return the environment's value for `key`, falling back to the YAML section.
+
+        A blank value counts as unset, which is what makes the empty pass-through
+        entries in docker-compose.yml harmless. Reporting is deliberately not done here:
+        it happens once per process in `_report_startup_window`, after both the declared
+        and the effective window are known and can be compared.
+        """
+        if use_environment:
+            raw = os.environ.get(env_name)
+            if raw is not None and raw.strip():
+                return raw
+        return section.get(key)
+
+    @classmethod
+    def _build(
+        cls, section: Mapping[str, Any], use_environment: bool
+    ) -> "OperationalHours":
+        """Parse the window, honouring GRIDSNARE_OPERATIONAL_* only if asked to."""
+        zone_name = str(
+            cls._override("timezone", cls.ENV_TZ, section, use_environment) or "UTC"
         )
-        return raw
-
-    @classmethod
-    def from_mapping(cls, section: Mapping[str, Any]) -> "OperationalHours":
-        if not isinstance(section, Mapping):
-            raise RuleConfigError("engine.detection.operational_hours must be a mapping")
-
-        zone_name = str(cls._override("timezone", cls.ENV_TZ, section) or "UTC")
         try:
             zone = ZoneInfo(zone_name)
         except Exception as exc:  # ZoneInfoNotFoundError, or missing tzdata
@@ -137,15 +158,105 @@ class OperationalHours:
 
         return cls(
             start=_parse_hhmm(
-                cls._override("start", cls.ENV_START, section), "operational_hours.start"
+                cls._override("start", cls.ENV_START, section, use_environment),
+                "operational_hours.start",
             ),
             end=_parse_hhmm(
-                cls._override("end", cls.ENV_END, section), "operational_hours.end"
+                cls._override("end", cls.ENV_END, section, use_environment),
+                "operational_hours.end",
             ),
             days=frozenset(days),
             zone=zone,
             zone_name=zone_name,
         )
+
+    @staticmethod
+    def _zone_offsets(zone: tzinfo) -> Tuple[Any, ...]:
+        """UTC offsets at four sample instants across a year.
+
+        Comparing zones by name would call `Etc/UTC` different from `UTC`, which is the
+        same zone under two names; comparing offsets catches a genuinely different zone
+        without depending on which alias it was written with. Four seasons, so a zone
+        that differs only during daylight saving is still caught.
+        """
+        return tuple(
+            datetime(year, month, 1, 12, tzinfo=timezone.utc).astimezone(zone).utcoffset()
+            for year, month in ((2026, 1), (2026, 4), (2026, 7), (2026, 10))
+        )
+
+    @classmethod
+    def _report_startup_window(
+        cls, declared: "OperationalHours", effective: "OperationalHours"
+    ) -> None:
+        """Announce the operational window this process will actually use at startup.
+
+        Whenever any GRIDSNARE_OPERATIONAL_* variable is present a WARNING is emitted —
+        including when it is set to exactly what config.yaml already declares, because a
+        variable that changes nothing today is still a variable someone will have
+        forgotten about tomorrow. Emitting it only when the value differs would also mean
+        the log stayed silent in the one case that is hardest to diagnose afterwards.
+
+        The committed config.yaml is never modified: SPEC.md Section 8 keeps it the
+        source of truth, and the override exists only so SPEC.md Section 12's TC-2 can be
+        measured outside operational hours.
+        """
+        supplied = [
+            (name, os.environ[name])
+            for _, name in cls.ENV_OVERRIDES
+            if os.environ.get(name, "").strip()
+        ]
+        if not supplied:
+            return
+
+        variables = ", ".join(f"{name}={value!r}" for name, value in supplied)
+        effective_window = (
+            f"{effective.start.strftime('%H:%M')}-{effective.end.strftime('%H:%M')} "
+            f"{effective.zone_name}"
+        )
+        declared_window = (
+            f"{declared.start.strftime('%H:%M')}-{declared.end.strftime('%H:%M')} "
+            f"{declared.zone_name}"
+        )
+        active = (
+            declared.start != effective.start
+            or declared.end != effective.end
+            or cls._zone_offsets(declared.zone) != cls._zone_offsets(effective.zone)
+        )
+
+        if active:
+            LOG.warning(
+                "OPERATIONAL-HOURS OVERRIDE ACTIVE for this process: DR-4 will judge "
+                "activity against %s, not the configured %s (%s). DR-4 therefore will "
+                "not fire where it normally would, and config.yaml on disk is unchanged. "
+                "This exists only so the validation suite (SPEC.md Section 12) can "
+                "measure TC-2 outside operational hours; unset these variables and "
+                "restart to restore normal detection.",
+                effective_window, declared_window, variables,
+            )
+        else:
+            LOG.warning(
+                "OPERATIONAL-HOURS OVERRIDE PRESENT BUT INERT: %s is set, but the window "
+                "it declares (%s) is the configured one (%s), so DR-4 behaves normally "
+                "here. Nothing changed for this process — but a variable that does "
+                "nothing today is still in the environment when someone expects it to "
+                "do something tomorrow; unset it when you are done.",
+                variables, effective_window, declared_window,
+            )
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "OperationalHours":
+        if not isinstance(section, Mapping):
+            raise RuleConfigError("engine.detection.operational_hours must be a mapping")
+
+        # Parse twice: once as config.yaml declares the window, once with whatever the
+        # environment supplies. Comparing the two is the only way to report the truth —
+        # a variable set to the value config.yaml already declares changes nothing, and
+        # calling that an override sends the reader looking for a cause that is not there.
+        # Both parses happen once per process, on the startup path.
+        declared = cls._build(section, use_environment=False)
+        effective = cls._build(section, use_environment=True)
+        cls._report_startup_window(declared, effective)
+        return effective
 
 
 @dataclass(frozen=True)
