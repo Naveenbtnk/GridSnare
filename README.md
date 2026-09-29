@@ -31,7 +31,8 @@
 |---|---|
 | Phase 1 test suite | **6/6** cases passing across 6 independent full runs (TC-1 … TC-6) |
 | Phase 2 test suite | **7/7** cases passing on the current tree (TC-7 … TC-11, TC-13, TC-14) |
-| Full-suite run on the current tree | **12 passed, 1 skipped in 50.0 s** (13 automated cases). The skip is TC-2, which declines to run outside DR-4's configured operational window rather than reporting a pass it did not measure — run inside that window it passes for real: **605.6 s, 40/40 baseline requests observed, 0 alerts** |
+| Full-suite run on the current tree | **13/13 passed in 656.8 s** — the complete Section 12 + 20.6 plan with no case skipped, run at an off-hours wall clock (03:18 IST) through the documented operational-hours override. TC-2 passed for real: **40/40 baseline requests observed, 0 alerts, 0 DR-4** |
+| Off-hours baseline coverage | **3 → 0** DR-4 false positives from the suite's own whitelisted baseline traffic (every DR-4 alert this lab ever raised was the baseline being judged out-of-hours at 21:36 / 22:28 / 22:33 IST) |
 | GOOSE detection rules | **GR-1 … GR-4 implemented**, config-driven, each firing on real injected frames in the lab (SPEC.md 20.3) |
 | GR-5 SWaT validation | **78.74% detection at 5.07% FPR** — 43,007 / 54,621 attack rows; 10,548 / 208,066 held-out normal rows |
 | False positives eliminated | **80 → 0** after the legitimate PLC baseline was added (Section 11) |
@@ -52,6 +53,7 @@
 - [Data analysis — how the metrics relate](#-data-analysis--how-the-metrics-relate)
 - [Real-world validation](#-real-world-validation)
 - [Quick start](#-quick-start)
+- [Run the full plan at any hour](#-run-the-full-plan-at-any-hour)
 - [Tech stack](#-tech-stack)
 - [Network topology](#-network-topology)
 - [Build status](#-build-status)
@@ -126,7 +128,10 @@ poll loop with no manual step, verified by a clean-room teardown/rebuild (see
 
 Validation follows SPEC.md Sections 12 and 20.6: **13 automated integration cases** in
 `tests/test_scenarios.py`, run end-to-end against the live stack and asserted against the same
-SQLite store and dashboard API an operator would read.
+SQLite store and dashboard API an operator would read. All 13 pass on the current tree; TC-2
+needs either the committed 06:00–20:00 IST window or the documented
+[operational-hours override](#-run-the-full-plan-at-any-hour), and says so rather than skipping
+silently.
 
 | Case | Expected result | Outcome |
 |---|---|---|
@@ -174,7 +179,7 @@ pie showData
 <summary>Per-case evidence (click to expand)</summary>
 
 - **TC-1** — an FC 3 read to the decoy was captured, ingested, and produced `['DR-1', 'DR-7']`.
-- **TC-2** — 40 whitelisted reads over 600 s to the real PLC (5/min, half of DR-6's limit): 40/40 observed, 0 alerts.
+- **TC-2** — 40 whitelisted reads over 600 s to the real PLC (5/min, half of DR-6's limit): 40/40 observed, 0 alerts; measured at 03:18 IST under the documented override, with the store holding **0** DR-4 alerts for the run.
 - **TC-3** — FC 43 (Read Device Identification) to the decoy produced `[('DR-2', 'High')]`.
 - **TC-4** — FC 6 write of 16962 to register 59 (range 0–9) produced DR-2, DR-3, DR-7, and DR-1.
 - **TC-5** — an out-of-range write and the resulting honeypot hit were linked by DR-7 into one Critical alert.
@@ -286,6 +291,53 @@ docker run --rm --network gridsnare_scada_net --cap-add NET_RAW \
   -v "$(pwd)/tests:/probe:ro" python:3.12-slim \
   python /probe/goose_lab.py --interface eth0 capture --seconds 12
 ```
+
+## 🕓 Run the full plan at any hour
+
+TC-2 measures the no-false-positive baseline — ten minutes of whitelisted traffic to the *real*
+PLC — and it only means anything inside the window DR-4 treats as operational hours
+(`engine.detection.operational_hours`, committed as 06:00–20:00 `Asia/Kolkata`). Outside it,
+that same whitelisted traffic *is* out-of-hours activity, so DR-4 fires **by design** and the
+case cannot honestly assert "no alerts"; it skips instead, leaving the baseline unmeasured.
+Every DR-4 alert this lab has ever raised was exactly that: the suite's own baseline at 21:36,
+22:28 and 22:33 IST.
+
+DR-4 is judged by the persistent `engine` service from **its own** config load, so the override
+has to reach that container and not just the test runner — otherwise the suite stops skipping
+while the engine keeps alerting. Exporting the three `GRIDSNARE_OPERATIONAL_*` variables widens
+the window for both services, leaves the committed `config.yaml` untouched, and makes every
+process that honours it log a warning naming the value it overrode, so an off-hours run is never
+silent about what it changed. The engine's startup log is the one to read:
+
+```bash
+# all 13 cases, at any hour, without editing config.yaml
+export GRIDSNARE_OPERATIONAL_START=00:00 GRIDSNARE_OPERATIONAL_END=23:59 \
+  && docker compose up -d engine \
+  && docker compose --profile test run --rm tests python -m pytest tests/test_scenarios.py -v
+```
+
+The `docker compose up -d engine` is the half that matters: it recreates the engine with the
+widened window, which it confirms on startup.
+
+```text
+operational_hours.start overridden by GRIDSNARE_OPERATIONAL_START='00:00' for this process —
+  the committed config.yaml still declares '06:00'. ...
+thresholds in effect: ... hours=00:00-23:59 Asia/Kolkata days=[0, 1, 2, 3, 4, 5, 6] ...
+```
+
+Because the variables are declared in `docker-compose.yml` for both services with an empty
+default, a plain `docker compose up -d` still uses the committed window and DR-4 can still fire
+off-hours. Put the engine back on it when the off-hours run is done:
+
+```bash
+unset GRIDSNARE_OPERATIONAL_START GRIDSNARE_OPERATIONAL_END && docker compose up -d engine
+```
+
+`GRIDSNARE_OPERATIONAL_TZ` is available for the same purpose if the window should be read in
+another zone. `00:00`–`23:59` covers every hour except two minutes a day: the minutes starting
+23:49 IST and 23:59 IST, where TC-2's 600-second baseline would no longer *end* inside the same
+window. Start anywhere else, or pass a wrapping window (for example `23:58`/`23:57`), and the
+case runs.
 
 ## 🧰 Tech stack
 

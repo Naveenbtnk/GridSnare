@@ -242,6 +242,28 @@ services:
     command: ["python", "-u", "-m", "engine.correlator"]
     restart: unless-stopped
 
+    # DR-4 (unexpected activity outside operational hours) is judged by *this* process
+    # from its own config load, so an off-hours override has to arrive here and not
+    # only in the test runner — otherwise the suite's baseline traffic is correctly
+    # flagged as out-of-hours and TC-2 skips (or fails) no matter what the runner
+    # believes. engine/rules.py reads these three names and falls back to the YAML
+    # section when they are blank, so they are passed through empty by default: a
+    # normal `docker compose up` still uses the committed 06:00-20:00
+    # Asia/Kolkata window and DR-4 still fires off-hours. Exporting them for one run
+    # widens the window for both this service and `tests`:
+    #
+    #   GRIDSNARE_OPERATIONAL_START=00:00 GRIDSNARE_OPERATIONAL_END=23:59 \
+    #     docker compose up -d engine
+    #
+    # which recreates this container with a window wide enough for the Section 12
+    # plan to run at any hour (README, "Run the full plan at any hour"). Re-running
+    # `docker compose up -d engine` with the variables unset restores the committed
+    # window; every override is logged as a warning at startup.
+    environment:
+      GRIDSNARE_OPERATIONAL_START: "${GRIDSNARE_OPERATIONAL_START:-}"
+      GRIDSNARE_OPERATIONAL_END: "${GRIDSNARE_OPERATIONAL_END:-}"
+      GRIDSNARE_OPERATIONAL_TZ: "${GRIDSNARE_OPERATIONAL_TZ:-}"
+
     # The engine does not use the network. It reads config.yaml and the shared store,
     # writes alerts and the engine_state heartbeat, and originates nothing.
     network_mode: "none"
@@ -626,6 +648,16 @@ services:
     # joins the GOOSE multicast group with PACKET_MR_PROMISC, which does not need it.
     cap_add:
       - NET_RAW
+
+    # The same off-hours pass-through as the `engine` service above: TC-2 decides
+    # whether to run (or skip) by asking the engine's own rules module whether the
+    # 600-second baseline fits inside the configured window, so it needs the identical
+    # GRIDSNARE_OPERATIONAL_* values. Blank by default — the committed 06:00-20:00
+    # Asia/Kolkata window is used unless the variables are exported for the run.
+    environment:
+      GRIDSNARE_OPERATIONAL_START: "${GRIDSNARE_OPERATIONAL_START:-}"
+      GRIDSNARE_OPERATIONAL_END: "${GRIDSNARE_OPERATIONAL_END:-}"
+      GRIDSNARE_OPERATIONAL_TZ: "${GRIDSNARE_OPERATIONAL_TZ:-}"
 
     volumes:
       # The shared store. Mounted read-write because the suite advances the engine
