@@ -536,7 +536,7 @@ def fetch_pipeline(
         state = "starting"
         summary = (
             "No events in the store yet, so there is nothing to be stale about. "
-            "Send Modbus traffic to the honeypot and start the engine "
+            "Send Modbus or GOOSE traffic and start the engine "
             "(engine/correlator.py) — until then no detection is running."
         )
     elif engine_state_name == "behind":

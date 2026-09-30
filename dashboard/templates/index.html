@@ -371,6 +371,18 @@
 
     footer.notes { margin-top: 22px; font-size: 11.5px; line-height: 1.75; color: var(--ink-3); }
     footer.notes strong { color: var(--ink-2); font-weight: 600; }
+    /* Footer facts, carded: four titled blocks a reader can scan instead of one
+       run-on paragraph they skip. auto-fit reflows to 2x2 / 1x4 on narrow windows. */
+    .notes-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(235px, 1fr)); gap: 12px; }
+    .notes-grid section {
+      background: #fcfdfe; border: 1px solid var(--line); border-radius: var(--r-sm);
+      padding: 10px 13px; line-height: 1.6;
+    }
+    .notes-grid h3 {
+      margin: 0 0 4px; font: 700 9.5px var(--sans); letter-spacing: .12em;
+      text-transform: uppercase; color: var(--ink-4);
+    }
+    .notes-grid p { margin: 0; }
     code {
       font: 500 11px var(--mono); color: var(--violet-ink);
       background: rgba(124,92,255,.10); border: 1px solid rgba(124,92,255,.22);
@@ -489,7 +501,7 @@
       <div class="page-head">
         <div>
           <h1>Overview</h1>
-          <p>Live detections from the honeypot and the Modbus traffic monitor.</p>
+          <p>Live detections from the honeypot, the Modbus traffic monitor, and the GOOSE protocol monitor.</p>
         </div>
         <div class="page-tools">
           <div class="segmented" id="window-control" role="group" aria-label="Timeline window"></div>
@@ -584,7 +596,7 @@
               <div class="eyebrow">Detection</div>
               <h2>Severity breakdown</h2>
             </div>
-            <span class="caption">DR-1 – DR-7</span>
+            <span class="caption">DR-1 – DR-7 · GR-1 – GR-4</span>
           </div>
           <div class="chart-box"><canvas id="severity-chart"></canvas></div>
         </article>
@@ -640,16 +652,24 @@
       </section>
 
       <footer class="notes">
-        <strong>How to read this.</strong> Rule IDs are from SPEC.md Section 8, and each rule carries its
-        own colour in the feed. A <span class="chip" style="--chip-mark:#7c5cff;--chip-line:rgba(124,92,255,.3);--chip-bg:rgba(124,92,255,.1);--chip-ink:#5433cc">correlated</span>
-        mark is DR-7: one source IP in both the honeypot log and the monitor log inside the correlation window.
-        <strong>Every figure comes from the shared SQLite store</strong> — nothing here is sample data.
-        The search box and the filters act on the alerts already loaded on this page, not on the whole store.
-        Timeline bars are bucketed per minute in UTC and labelled in this browser's local time; quiet minutes
-        are plotted as zero rather than skipped.
-        <br>
-        <strong>Limitation (SPEC.md Section 7.5):</strong> no authentication — this is a local lab demo and
-        must not be exposed beyond localhost.
+        <div class="notes-grid">
+          <section>
+            <h3>How to read this</h3>
+            <p>Rule IDs come from the detection catalog — DR-1..DR-7 (SPEC.md §8) and GR-1..GR-4 (§20.3) — and each
+            rule carries its own colour in the feed. A <span class="chip" style="--chip-mark:#7c5cff;--chip-line:rgba(124,92,255,.3);--chip-bg:rgba(124,92,255,.1);--chip-ink:#5433cc">correlated</span>
+            mark is DR-7: one source IP in both the honeypot log and the monitor log inside the correlation window.</p>
+          </section>
+          <section>
+            <h3>Where the numbers come from</h3>
+            <p><strong>Every figure comes from the shared SQLite store</strong> — nothing here is sample data.
+            The search box and the filters act on the alerts already loaded on this page, not on the whole store.</p>
+          </section>
+          <section>
+            <h3>Reading the timeline</h3>
+            <p>Bars are bucketed per minute in UTC and labelled in this browser's local time; quiet minutes are
+            plotted as zero rather than skipped.</p>
+          </section>
+        </div>
       </footer>
     </main>
   </div>

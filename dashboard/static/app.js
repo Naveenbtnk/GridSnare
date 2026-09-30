@@ -45,11 +45,16 @@
     "DR-5": { mark: "#4f46e5", ink: "#322ca8" },
     "DR-6": { mark: "#00c888", ink: "#046b4b" },
     "DR-7": { mark: "#e1009f", ink: "#a3006f" },
+    "GR-1": { mark: "#38bdf8", ink: "#0b6ea8" },
+    "GR-2": { mark: "#f97316", ink: "#b34a00" },
+    "GR-3": { mark: "#a3e635", ink: "#4d7c0f" },
+    "GR-4": { mark: "#e879f9", ink: "#a21caf" },
     "—":    { mark: "#94a3b8", ink: "#4a5666" }
   };
 
   var PROTOCOLS = {
     modbus: { mark: "#4f46e5", ink: "#322ca8" },
+    goose:  { mark: "#38bdf8", ink: "#0b6ea8" },
     http:   { mark: "#e1009f", ink: "#a3006f" },
     snmp:   { mark: "#00b3a4", ink: "#00665e" },
     s7comm: { mark: "#38bdf8", ink: "#0b6ea8" },
